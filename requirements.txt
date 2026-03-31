@@ -1,8 +1,5 @@
 fastapi
 uvicorn
-httpx
 supabase
+httpx
 python-dotenv
-openai
-google-generativeai
-pydantic
