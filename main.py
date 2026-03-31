@@ -15,6 +15,24 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Lung")
 
+# Required environment variables
+REQUIRED_KEYS = [
+    "DEEPSEEK_API_KEYS",
+    "GROQ_API_KEY",
+    "CEREBRAS_API_KEY",
+    "MISTRAL_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_KEY"
+]
+
+missing = [k for k in REQUIRED_KEYS if not os.getenv(k)]
+if missing:
+    logger.error(f"Missing required environment variables: {', '.join(missing)}")
+    logger.error("Please add them in Render dashboard under Environment.")
+    # We'll still start the web service, but background workers will not run.
+    # This allows the status endpoint to show an error.
+
+# Parse keys
 DEEPSEEK_KEYS = [k.strip() for k in os.getenv("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 CEREBRAS_KEY = os.getenv("CEREBRAS_API_KEY")
@@ -26,15 +44,17 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "50"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
 
-# ---------- Model definitions ----------
-MODELS = [
-    {"name": "groq", "endpoint": "https://api.groq.com/openai/v1/chat/completions",
-     "model_id": "llama3-70b-8192", "api_key": GROQ_KEY},
-    {"name": "cerebras", "endpoint": "https://api.cerebras.ai/v1/chat/completions",
-     "model_id": "llama3.1-70b", "api_key": CEREBRAS_KEY},
-    {"name": "mistral", "endpoint": "https://api.mistral.ai/v1/chat/completions",
-     "model_id": "mistral-large-latest", "api_key": MISTRAL_KEY}
-]
+# ---------- Model definitions (only if keys exist) ----------
+MODELS = []
+if GROQ_KEY:
+    MODELS.append({"name": "groq", "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+                   "model_id": "llama3-70b-8192", "api_key": GROQ_KEY})
+if CEREBRAS_KEY:
+    MODELS.append({"name": "cerebras", "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+                   "model_id": "llama3.1-70b", "api_key": CEREBRAS_KEY})
+if MISTRAL_KEY:
+    MODELS.append({"name": "mistral", "endpoint": "https://api.mistral.ai/v1/chat/completions",
+                   "model_id": "mistral-large-latest", "api_key": MISTRAL_KEY})
 
 PROMPTS = [
     "Generate a strategic mutation for venture architecture optimization.",
@@ -47,6 +67,8 @@ PROMPTS = [
 def generate_agents(count):
     agents = []
     for i in range(count):
+        if not MODELS:
+            break
         model = random.choice(MODELS)
         prompt = random.choice(PROMPTS)
         agents.append({
@@ -94,9 +116,11 @@ class KeyPool:
             self.index += 1
             return k
 
-key_pool = KeyPool(DEEPSEEK_KEYS)
+key_pool = KeyPool(DEEPSEEK_KEYS) if DEEPSEEK_KEYS else None
 
 async def audit_proposal(proposal):
+    if not key_pool:
+        return {"score": 0, "accepted": False, "reason": "No DeepSeek keys"}
     key = await key_pool.get()
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
@@ -124,9 +148,14 @@ async def audit_proposal(proposal):
         accepted = score >= THRESHOLD
         return {"score": score, "accepted": accepted, "reason": reason}
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Supabase client (only if credentials exist)
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def store_mutation(proposal, audit):
+    if not supabase:
+        return
     if audit["accepted"]:
         supabase.table("mutations").insert({
             "source": proposal["source"],
@@ -161,11 +190,16 @@ async def worker(agent, sem):
 # ---------- FastAPI app ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start background swarm on startup
+    if not MODELS or not key_pool or not supabase:
+        logger.warning("Missing required services. Background workers will not start.")
+        yield
+        return
     logger.info(f"Lung starting: {WORKER_COUNT} workers, {AGENT_COUNT} agents")
     sem = asyncio.Semaphore(MAX_CONCURRENT)
     tasks = []
     for i in range(WORKER_COUNT):
+        if i >= len(AGENTS):
+            break
         agent = AGENTS[i % len(AGENTS)]
         tasks.append(asyncio.create_task(worker(agent, sem)))
     app.state.tasks = tasks
@@ -185,10 +219,12 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"message": "LROS Lung Engine", "workers": WORKER_COUNT, "agents": AGENT_COUNT}
+    return {"message": "LROS Lung Engine", "workers": WORKER_COUNT, "agents": len(AGENTS), "status": "ok" if MODELS and key_pool and supabase else "missing_keys"}
 
 @app.get("/status")
 async def status():
+    if not supabase:
+        return {"error": "Supabase not configured"}
     try:
         recent_mutations = supabase.table("mutations").select("*").order("created_at", desc=True).limit(5).execute()
         recent_vetoes = supabase.table("vetoes").select("*").order("timestamp", desc=True).limit(5).execute()
@@ -198,7 +234,7 @@ async def status():
         return {"error": str(e)}
     return {
         "workers": WORKER_COUNT,
-        "agents": AGENT_COUNT,
+        "agents": len(AGENTS),
         "threshold": THRESHOLD,
         "mutations_total": mutation_count,
         "vetoes_total": veto_count,
