@@ -170,7 +170,6 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(worker(agent, sem)))
     app.state.tasks = tasks
     yield
-    # Cleanup if needed
     for t in tasks:
         t.cancel()
 
@@ -190,7 +189,6 @@ async def root():
 
 @app.get("/status")
 async def status():
-    # Quick stats from Supabase (last 10 accepted and vetoed)
     try:
         recent_mutations = supabase.table("mutations").select("*").order("created_at", desc=True).limit(5).execute()
         recent_vetoes = supabase.table("vetoes").select("*").order("timestamp", desc=True).limit(5).execute()
