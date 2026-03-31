@@ -8,9 +8,9 @@ import google.generativeai as genai
 from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("LROS-Apex-Core")
+logger = logging.getLogger("LROS-Omni-Swarm")
 
-app = FastAPI(title="LROS Engine 2: Auto-Healing Dual-Core")
+app = FastAPI(title="LROS Engine 2: 5-Node Auto-Healing Swarm")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- CREDENTIALS & DB ---
@@ -20,7 +20,7 @@ HEART_API_URL = os.environ.get("HEART_API_URL")
 
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
-# --- NEW: KEY SANITIZER & VAULT ---
+# --- THE KEY VAULT & SANITIZER ---
 def get_clean_keys(env_var_name):
     """Slices comma-separated keys, strips invisible spaces, and ignores blanks."""
     raw_string = os.environ.get(env_var_name, "")
@@ -29,6 +29,9 @@ def get_clean_keys(env_var_name):
 
 DEEPSEEK_KEYS = get_clean_keys("DEEPSEEK_API_KEY")
 GEMINI_KEYS = get_clean_keys("GEMINI_API_KEY")
+GROQ_KEYS = get_clean_keys("GROQ_API_KEY")
+CEREBRAS_KEYS = get_clean_keys("CEREBRAS_API_KEY")
+MISTRAL_KEYS = get_clean_keys("MISTRAL_API_KEY")
 
 # --- LAYER 5400: CLOUD MEMORY ---
 def get_memory():
@@ -38,7 +41,7 @@ def get_memory():
         default_state = {
             "master_successes": 439434, "heart_successes": 0, "lung_successes": 0,
             "daily_learning": 11562.76, "rejections": 0, "mutation_ledger": [],
-            "lung_logs": ["🚀 Lung Engine 2 Online. Key Rotation Protocol Active."]
+            "lung_logs": ["🚀 Lung Engine 2 Online. 5-Node Swarm Active."]
         }
         db.table("sovereign_state").insert({"id": 1, "state_data": default_state}).execute()
         return default_state
@@ -49,53 +52,60 @@ def save_memory(state):
         db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
 
 # --- EXECUTION LOGIC (WITH AUTO-ROTATION) ---
+async def call_openai_compatible(keys, base_url, model, prompt, system_prompt, provider_name):
+    if not keys: return None
+    for key in keys:
+        try:
+            client = AsyncOpenAI(api_key=key, base_url=base_url)
+            res = await client.chat.completions.create(
+                model=model, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+            )
+            if res.choices: return res.choices[0].message.content
+        except Exception as e:
+            logger.warning(f"[{provider_name}] Key {key[:4]}... failed. Trying next. Error: {e}")
+            continue
+    return None
+
 async def call_llm(provider: str, model: str, prompt: str, system_prompt: str = "You are LROS."):
     if provider == "gemini":
-        if not GEMINI_KEYS:
-            logger.warning("[GEMINI] No keys configured in vault.")
-            return None
-            
-        # Try keys one by one until success
+        if not GEMINI_KEYS: return None
         for key in GEMINI_KEYS:
             try:
                 genai.configure(api_key=key)
                 gemini_client = genai.GenerativeModel('gemini-2.5-flash')
                 return gemini_client.generate_content(f"{system_prompt}\n\n{prompt}").text
             except Exception as e:
-                logger.warning(f"[GEMINI] Key {key[:4]}... failed. Trying next key. Error: {e}")
+                logger.warning(f"[GEMINI] Key failed. Trying next. Error: {e}")
                 continue
-        return None # All keys failed
-
+        return None
     elif provider == "deepseek":
-        if not DEEPSEEK_KEYS:
-            logger.warning("[DEEPSEEK] No keys configured in vault.")
-            return None
-            
-        # Try keys one by one until success
-        for key in DEEPSEEK_KEYS:
-            try:
-                client = AsyncOpenAI(api_key=key, base_url="https://api.deepseek.com")
-                res = await client.chat.completions.create(
-                    model=model, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
-                )
-                if res.choices: return res.choices[0].message.content
-            except Exception as e:
-                logger.warning(f"[DEEPSEEK] Key {key[:4]}... failed. Trying next key. Error: {e}")
-                continue
-        return None # All keys failed
-        
+        return await call_openai_compatible(DEEPSEEK_KEYS, "https://api.deepseek.com", model, prompt, system_prompt, "DEEPSEEK")
+    elif provider == "groq":
+        return await call_openai_compatible(GROQ_KEYS, "https://api.groq.com/openai/v1", model, prompt, system_prompt, "GROQ")
+    elif provider == "cerebras":
+        return await call_openai_compatible(CEREBRAS_KEYS, "https://api.cerebras.ai/v1", model, prompt, system_prompt, "CEREBRAS")
+    elif provider == "mistral":
+        return await call_openai_compatible(MISTRAL_KEYS, "https://api.mistral.ai/v1", model, prompt, system_prompt, "MISTRAL")
     return None
 
 async def swarm_consensus(prompt: str):
-    tasks = [
-        call_llm("gemini", "gemini-2.5-flash", prompt, "You are a bold AI CEO. Answer the prompt."),
-        call_llm("deepseek", "deepseek-chat", prompt, "You are an analytical AI CFO. Answer the prompt.")
-    ]
+    """Fires all available APIs simultaneously and DeepSeek audits the ultimate answer."""
+    tasks = []
+    if CEREBRAS_KEYS: tasks.append(call_llm("cerebras", "llama3.1-70b", prompt))
+    if GROQ_KEYS: tasks.append(call_llm("groq", "llama-3.3-70b-versatile", prompt))
+    if GEMINI_KEYS: tasks.append(call_llm("gemini", "gemini-2.5-flash", prompt))
+    if MISTRAL_KEYS: tasks.append(call_llm("mistral", "mistral-large-latest", prompt))
+    
+    # Fallback to a simple chain if only DeepSeek is alive
+    if not tasks: tasks.append(call_llm("deepseek", "deepseek-chat", prompt))
+
     results = await asyncio.gather(*tasks)
     valid_results = [r for r in results if r is not None]
-    if not valid_results: return "Swarm Overload: All API keys across all providers failed."
     
-    audit_prompt = f"Synthesize the ultimate answer from these perspectives: {valid_results}"
+    if not valid_results: return "Swarm Overload: All API keys failed."
+    if len(valid_results) == 1: return valid_results[0]
+    
+    audit_prompt = f"Synthesize the ultimate answer from these AI perspectives: {valid_results}"
     final_answer = await call_llm("deepseek", "deepseek-reasoner", audit_prompt)
     return final_answer if final_answer else valid_results[0]
 
@@ -125,21 +135,32 @@ async def lung_evolution_cycle():
                 
             domain = random.choice(domains)
             
-            # --- AUTO-HEAL ---
-            hypothesis = await call_llm("gemini", "gemini-2.5-flash", f"Generate a 1-paragraph optimization strategy for {domain}.")
-            generator_used = "GEMINI"
-            
+            # --- ASYMMETRIC LOAD BALANCING ---
+            available_generators = []
+            if GEMINI_KEYS: available_generators.append(("gemini", "gemini-2.5-flash"))
+            if GROQ_KEYS: available_generators.append(("groq", "llama-3.3-70b-versatile"))
+            if CEREBRAS_KEYS: available_generators.append(("cerebras", "llama3.1-70b"))
+            if MISTRAL_KEYS: available_generators.append(("mistral", "mistral-large-latest"))
+
+            if available_generators:
+                prov, mod = random.choice(available_generators)
+                hypothesis = await call_llm(prov, mod, f"Generate a 1-paragraph optimization strategy for {domain}.")
+                generator_used = prov.upper()
+            else:
+                hypothesis = None
+
+            # Auto-Heal to DeepSeek if primary fails
             if not hypothesis: 
-                logger.warning("All Gemini keys failed. Auto-healing to DeepSeek.")
+                logger.warning("Generators failed. Auto-healing to DeepSeek.")
                 hypothesis = await call_llm("deepseek", "deepseek-chat", f"Generate a 1-paragraph optimization strategy for {domain}.")
                 generator_used = "DEEPSEEK"
 
             if not hypothesis:
-                logger.error("CRITICAL: Both Gemini and DeepSeek key vaults failed. Cannot generate.")
+                logger.error("CRITICAL: All key vaults failed. Cannot generate.")
                 await asyncio.sleep(30)
                 continue
             
-            # --- AUDIT ---
+            # --- DEEPSEEK OMBUDSMAN AUDIT ---
             score_prompt = f"Audit this strategy: {hypothesis}. Score strictly 0-100 based on ROI and logic. Return ONLY the integer."
             audit_res = await call_llm("deepseek", "deepseek-chat", score_prompt)
             
@@ -183,7 +204,11 @@ async def multi_ai_chat(req: MultiAIChat):
     mode = req.mode.lower()
     if mode == "parallel": response = await swarm_consensus(req.prompt)
     elif mode == "deepseek": response = await call_llm("deepseek", "deepseek-reasoner", req.prompt)
+    elif mode in ["groq", "cerebras", "mistral"]: 
+        models = {"groq": "llama-3.3-70b-versatile", "cerebras": "llama3.1-70b", "mistral": "mistral-large-latest"}
+        response = await call_llm(mode, models[mode], req.prompt)
     else: response = await call_llm("gemini", "gemini-2.5-flash", req.prompt)
+    
     if not response: response = "Neural Link Degraded. Please try again."
     return {"response": response, "mode_used": mode}
 
