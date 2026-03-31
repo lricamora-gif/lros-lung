@@ -8,9 +8,9 @@ import google.generativeai as genai
 from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("LROS-Dual-Core")
+logger = logging.getLogger("LROS-Apex-Core")
 
-app = FastAPI(title="LROS Engine 2: Dual-Core Swarm Orchestrator")
+app = FastAPI(title="LROS Engine 2: Auto-Healing Dual-Core")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- CREDENTIALS & DB ---
@@ -21,7 +21,6 @@ HEART_API_URL = os.environ.get("HEART_API_URL")
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
 # --- LAYER 5700: DUAL-CORE API CLIENTS ---
-# Stripped out Groq, Mistral, and Cerebras. Relying purely on stable volume.
 deepseek = AsyncOpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 gemini_client = genai.GenerativeModel('gemini-2.5-flash')
@@ -39,11 +38,10 @@ def get_memory():
             "daily_learning": 11562.76,
             "rejections": 0,
             "mutation_ledger": [],
-            "lung_logs": ["🚀 Lung Engine 2 Online. Dual-Core Mode Active."]
+            "lung_logs": ["🚀 Lung Engine 2 Online. Auto-Healing Protocol Active."]
         }
         db.table("sovereign_state").insert({"id": 1, "state_data": default_state}).execute()
         return default_state
-        
     return res.data[0]["state_data"]
 
 def save_memory(state):
@@ -64,21 +62,20 @@ async def call_llm(provider: str, model: str, prompt: str, system_prompt: str = 
                 return res.choices[0].message.content
         return None
     except Exception as e:
-        logger.warning(f"[{provider.upper()}] API Limit/Error: {e}")
+        logger.warning(f"[{provider.upper()}] API Error: {e}")
         return None
 
 async def swarm_consensus(prompt: str):
-    """Simulates a Swarm using just Gemini and DeepSeek by asking Gemini twice from different perspectives."""
     tasks = [
         call_llm("gemini", "gemini-2.5-flash", prompt, "You are a bold, visionary AI CEO. Answer the prompt."),
-        call_llm("gemini", "gemini-2.5-flash", prompt, "You are a conservative, highly analytical AI CFO. Answer the prompt.")
+        call_llm("deepseek", "deepseek-chat", prompt, "You are a conservative, highly analytical AI CFO. Answer the prompt.")
     ]
     results = await asyncio.gather(*tasks)
     
     valid_results = [r for r in results if r is not None]
-    if not valid_results: return "Swarm Overload: Gemini APIs rate-limited."
+    if not valid_results: return "Swarm Overload: All APIs offline."
 
-    audit_prompt = f"Review these two different AI perspectives to the prompt: '{prompt}'. Synthesize the ultimate, perfect executive answer. Perspectives: {valid_results}"
+    audit_prompt = f"Review these AI perspectives to the prompt: '{prompt}'. Synthesize the ultimate answer. Perspectives: {valid_results}"
     final_answer = await call_llm("deepseek", "deepseek-reasoner", audit_prompt)
     
     return final_answer if final_answer else valid_results[0]
@@ -105,14 +102,22 @@ async def lung_evolution_cycle():
             state = get_memory()
             domain = random.choice(domains)
             
-            # Gemini generates the idea (Heavy Lifting)
+            # --- AUTO-HEALING GENERATION ---
+            # 1. Try Gemini First
             hypothesis = await call_llm("gemini", "gemini-2.5-flash", f"Generate a 1-paragraph optimization strategy for {domain}.")
+            generator_used = "GEMINI"
             
+            # 2. If Gemini fails (Invalid Key), DeepSeek instantly takes over
             if not hypothesis: 
+                logger.warning("Gemini failed. Auto-healing: Routing generation to DeepSeek.")
+                hypothesis = await call_llm("deepseek", "deepseek-chat", f"Generate a 1-paragraph optimization strategy for {domain}.")
+                generator_used = "DEEPSEEK"
+
+            if not hypothesis:
                 await asyncio.sleep(15)
                 continue
             
-            # DeepSeek audits the idea (The Brain)
+            # --- DEEPSEEK OMBUDSMAN AUDIT ---
             score_prompt = f"Audit this strategy: {hypothesis}. Score strictly 0-100 based on ROI and logic. Return ONLY the integer."
             audit_res = await call_llm("deepseek", "deepseek-chat", score_prompt)
             
@@ -120,6 +125,7 @@ async def lung_evolution_cycle():
                 audit_score = int(''.join(filter(str.isdigit, audit_res))) if audit_res else 0
             except: audit_score = 0
 
+            # --- LEDGER COMMIT ---
             if audit_score >= 95:
                 state["lung_successes"] += 1
                 state["master_successes"] = 439434 + state["lung_successes"] + state.get("heart_successes", 0)
@@ -127,18 +133,18 @@ async def lung_evolution_cycle():
                 state["daily_learning"] += evolved_score
                 
                 state["mutation_ledger"].insert(0, {
-                    "version": f"DNA-E9.80.{state['lung_successes']%1000}",
-                    "agent": f"GEMINI-{random.randint(100,999)}",
+                    "version": f"DNA-E9.99.{state['lung_successes']%1000}",
+                    "agent": f"{generator_used}-{random.randint(100,999)}",
                     "domain": domain,
                     "ts": datetime.utcnow().strftime("%H:%M:%S"),
                     "audit_score": audit_score,
                     "evolved": evolved_score
                 })
                 if len(state["mutation_ledger"]) > 20: state["mutation_ledger"].pop()
-                state["lung_logs"].append(f"[GEMINI] Vetted Pattern: {domain} (Score: {audit_score}%)")
+                state["lung_logs"].append(f"[{generator_used}] Vetted Pattern: {domain} (Score: {audit_score}%)")
             else:
                 state["rejections"] = state.get("rejections", 0) + 1
-                state["lung_logs"].append(f"[VETO] DeepSeek rejected Gemini drift. Score: {audit_score}%")
+                state["lung_logs"].append(f"[VETO] DeepSeek rejected {generator_used} drift. Score: {audit_score}%")
                 
             if len(state["lung_logs"]) > 15: state["lung_logs"].pop(0)
             save_memory(state)
@@ -146,8 +152,7 @@ async def lung_evolution_cycle():
         except Exception as e:
             logger.error(f"Evolution Loop Error: {e}")
             
-        # PACING EXTENDED TO 65 SECONDS to guarantee we never hit Gemini's 1,500 Requests/Day limit
-        await asyncio.sleep(65) 
+        await asyncio.sleep(45) 
 
 # --- FRONTEND API ENDPOINTS ---
 class MultiAIChat(BaseModel):
@@ -163,7 +168,6 @@ async def multi_ai_chat(req: MultiAIChat):
     elif mode == "deepseek":
         response = await call_llm("deepseek", "deepseek-reasoner", req.prompt)
     else:
-        # Default fallback is Gemini
         response = await call_llm("gemini", "gemini-2.5-flash", req.prompt)
 
     if not response: response = "Neural Link Degraded. Please try again."
