@@ -20,10 +20,15 @@ HEART_API_URL = os.environ.get("HEART_API_URL")
 
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
-# --- LAYER 5700: DUAL-CORE API CLIENTS ---
-deepseek = AsyncOpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-gemini_client = genai.GenerativeModel('gemini-2.5-flash')
+# --- NEW: KEY SANITIZER & VAULT ---
+def get_clean_keys(env_var_name):
+    """Slices comma-separated keys, strips invisible spaces, and ignores blanks."""
+    raw_string = os.environ.get(env_var_name, "")
+    if not raw_string: return []
+    return [k.strip() for k in raw_string.split(",") if k.strip()]
+
+DEEPSEEK_KEYS = get_clean_keys("DEEPSEEK_API_KEY")
+GEMINI_KEYS = get_clean_keys("GEMINI_API_KEY")
 
 # --- LAYER 5400: CLOUD MEMORY ---
 def get_memory():
@@ -33,7 +38,7 @@ def get_memory():
         default_state = {
             "master_successes": 439434, "heart_successes": 0, "lung_successes": 0,
             "daily_learning": 11562.76, "rejections": 0, "mutation_ledger": [],
-            "lung_logs": ["🚀 Lung Engine 2 Online. Auto-Healing Protocol Active."]
+            "lung_logs": ["🚀 Lung Engine 2 Online. Key Rotation Protocol Active."]
         }
         db.table("sovereign_state").insert({"id": 1, "state_data": default_state}).execute()
         return default_state
@@ -43,20 +48,43 @@ def save_memory(state):
     if db:
         db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
 
-# --- EXECUTION LOGIC ---
+# --- EXECUTION LOGIC (WITH AUTO-ROTATION) ---
 async def call_llm(provider: str, model: str, prompt: str, system_prompt: str = "You are LROS."):
-    try:
-        if provider == "gemini":
-            return gemini_client.generate_content(f"{system_prompt}\n\n{prompt}").text
-        elif provider == "deepseek":
-            res = await deepseek.chat.completions.create(
-                model=model, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
-            )
-            if res.choices: return res.choices[0].message.content
-        return None
-    except Exception as e:
-        logger.warning(f"[{provider.upper()}] API Error: {e}")
-        return None
+    if provider == "gemini":
+        if not GEMINI_KEYS:
+            logger.warning("[GEMINI] No keys configured in vault.")
+            return None
+            
+        # Try keys one by one until success
+        for key in GEMINI_KEYS:
+            try:
+                genai.configure(api_key=key)
+                gemini_client = genai.GenerativeModel('gemini-2.5-flash')
+                return gemini_client.generate_content(f"{system_prompt}\n\n{prompt}").text
+            except Exception as e:
+                logger.warning(f"[GEMINI] Key {key[:4]}... failed. Trying next key. Error: {e}")
+                continue
+        return None # All keys failed
+
+    elif provider == "deepseek":
+        if not DEEPSEEK_KEYS:
+            logger.warning("[DEEPSEEK] No keys configured in vault.")
+            return None
+            
+        # Try keys one by one until success
+        for key in DEEPSEEK_KEYS:
+            try:
+                client = AsyncOpenAI(api_key=key, base_url="https://api.deepseek.com")
+                res = await client.chat.completions.create(
+                    model=model, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+                )
+                if res.choices: return res.choices[0].message.content
+            except Exception as e:
+                logger.warning(f"[DEEPSEEK] Key {key[:4]}... failed. Trying next key. Error: {e}")
+                continue
+        return None # All keys failed
+        
+    return None
 
 async def swarm_consensus(prompt: str):
     tasks = [
@@ -65,7 +93,7 @@ async def swarm_consensus(prompt: str):
     ]
     results = await asyncio.gather(*tasks)
     valid_results = [r for r in results if r is not None]
-    if not valid_results: return "Swarm Overload: APIs offline."
+    if not valid_results: return "Swarm Overload: All API keys across all providers failed."
     
     audit_prompt = f"Synthesize the ultimate answer from these perspectives: {valid_results}"
     final_answer = await call_llm("deepseek", "deepseek-reasoner", audit_prompt)
@@ -102,12 +130,12 @@ async def lung_evolution_cycle():
             generator_used = "GEMINI"
             
             if not hypothesis: 
-                logger.warning("Gemini failed. Auto-healing to DeepSeek.")
+                logger.warning("All Gemini keys failed. Auto-healing to DeepSeek.")
                 hypothesis = await call_llm("deepseek", "deepseek-chat", f"Generate a 1-paragraph optimization strategy for {domain}.")
                 generator_used = "DEEPSEEK"
 
             if not hypothesis:
-                logger.error("CRITICAL: Both Gemini and DeepSeek keys failed. Cannot generate.")
+                logger.error("CRITICAL: Both Gemini and DeepSeek key vaults failed. Cannot generate.")
                 await asyncio.sleep(30)
                 continue
             
