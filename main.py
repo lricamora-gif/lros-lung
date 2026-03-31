@@ -8,9 +8,9 @@ import google.generativeai as genai
 from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("LROS-Apex-v74")
+logger = logging.getLogger("LROS-Apex-v75")
 
-app = FastAPI(title="LROS Engine 2: Apex v74")
+app = FastAPI(title="LROS Engine 2: Sovereign Apex v75")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- CREDENTIALS & DB ---
@@ -32,37 +32,33 @@ MISTRAL_KEYS = get_clean_keys("MISTRAL_API_KEY")
 
 # --- LAYER 5400: CLOUD MEMORY ---
 def get_memory():
-    if not db: return {"error": "DB missing"}
+    if not db: return {"error": "DB Neural Link Severed"}
     res = db.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    
+    # Ground Truth Synchronization from image_4bd33f.png
     if not res.data:
         default_state = {
-            "master_successes": 439434, "heart_successes": 0, "lung_successes": 0,
-            "daily_learning": 5523.03, "rejections": 0, "mutation_ledger": [],
-            "lung_logs": ["🚀 LROS Apex v74 Online."],
-            "today_stats": {"successes": 0, "rejections": 0, "last_reset": "", "engine_hits": {}}
+            "master_successes": 926084, 
+            "heart_successes": 486650, 
+            "lung_successes": 0,
+            "daily_learning": 5523.03, 
+            "rejections": 56, 
+            "mutation_ledger": [],
+            "lung_logs": ["[SYS] Apex v75 Online. Ground Truth 926,084 Locked."],
+            "node_performance": {"gemini": 0, "groq": 0, "cerebras": 0, "mistral": 0, "deepseek": 0}
         }
         db.table("sovereign_state").insert({"id": 1, "state_data": default_state}).execute()
         return default_state
     
-    state = res.data[0]["state_data"]
-    # Daily Reset Logic
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    if state.get("today_stats", {}).get("last_reset") != today:
-        state["today_stats"] = {"successes": 0, "rejections": 0, "last_reset": today, "engine_hits": {}}
-    return state
+    return res.data[0]["state_data"]
 
 def save_memory(state):
     if db: db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
 
-# --- EXECUTION LOGIC ---
+# --- MULTI-NODE EXECUTION ---
 async def call_llm(provider: str, model: str, prompt: str, system_prompt: str = "You are LROS Sovereign Command."):
     provider = provider.lower()
-    keys = []
-    if provider == "gemini": keys = GEMINI_KEYS
-    elif provider == "deepseek": keys = DEEPSEEK_KEYS
-    elif provider == "groq": keys = GROQ_KEYS
-    elif provider == "cerebras": keys = CEREBRAS_KEYS
-    elif provider == "mistral": keys = MISTRAL_KEYS
+    keys = {"gemini": GEMINI_KEYS, "deepseek": DEEPSEEK_KEYS, "groq": GROQ_KEYS, "cerebras": CEREBRAS_KEYS, "mistral": MISTRAL_KEYS}.get(provider, [])
 
     for key in keys:
         try:
@@ -78,7 +74,7 @@ async def call_llm(provider: str, model: str, prompt: str, system_prompt: str = 
         except Exception: continue
     return None
 
-# --- LOOPS ---
+# --- DUAL-ENGINE CYCLES ---
 async def reconcile_memory():
     while True:
         try:
@@ -100,30 +96,30 @@ async def lung_evolution_cycle():
             state = get_memory()
             domain = random.choice(domains)
             available = [("gemini", "gemini-2.0-flash"), ("groq", "llama-3.3-70b-versatile"), ("cerebras", "llama3.1-70b"), ("mistral", "mistral-large-latest")]
-            prov, mod = random.choice([a for a in available if get_clean_keys(f"{a[0].upper()}_API_KEY")])
             
-            hypothesis = await call_llm(prov, mod, f"Propose one high-ROI optimization for {domain}.")
+            # Select random generator
+            prov, mod = random.choice([a for a in available if get_clean_keys(f"{a[0].upper()}_API_KEY")])
+            hypothesis = await call_llm(prov, mod, f"Generate a high-ROI optimization for {domain}.")
+            
             if not hypothesis: continue
 
-            audit_res = await call_llm("deepseek", "deepseek-chat", f"Audit this: {hypothesis}. Return ONLY an integer score 0-100.")
+            # Audit via DeepSeek
+            audit_res = await call_llm("deepseek", "deepseek-chat", f"Audit this strategy: {hypothesis}. Return ONLY an integer score 0-100.")
             try: audit_score = int(''.join(filter(str.isdigit, audit_res)))
             except: audit_score = 0
 
-            # Statistics Update
-            hits = state["today_stats"]["engine_hits"]
-            hits[prov] = hits.get(prov, 0) + 1
+            # Update Node Performance Metrics
+            state["node_performance"][prov] = state["node_performance"].get(prov, 0) + 1
 
             if audit_score >= 95:
                 state["lung_successes"] += 1
-                state["today_stats"]["successes"] += 1
-                state["mutation_ledger"].insert(0, {"version": f"DNA-{random.randint(100,999)}", "agent": prov.upper(), "domain": domain, "ts": datetime.utcnow().strftime("%H:%M:%S"), "audit_score": audit_score})
+                state["mutation_ledger"].insert(0, {"version": f"DNA-{random.randint(100,999)}", "agent": prov.upper(), "domain": domain, "ts": datetime.utcnow().strftime("%H:%M:%S"), "audit_score": audit_score, "evolved": 0.05})
                 state["lung_logs"].append(f"[{prov.upper()}] Vetted Pattern: {domain} (Score: {audit_score}%)")
             else:
                 state["rejections"] += 1
-                state["today_stats"]["rejections"] += 1
                 state["lung_logs"].append(f"[VETO] DeepSeek rejected {prov.upper()} drift. Score: {audit_score}%")
             
-            if len(state["lung_logs"]) > 20: state["lung_logs"].pop(0)
+            if len(state["lung_logs"]) > 25: state["lung_logs"].pop(0)
             save_memory(state)
         except Exception: pass
         await asyncio.sleep(45)
