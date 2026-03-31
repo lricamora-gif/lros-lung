@@ -1,165 +1,293 @@
+#!/usr/bin/env python3
+"""
+LROS Lung Engine – 500‑Agent Swarm with 50 Parallel Self‑Play Workers
+Ombudsman: DeepSeek Reasoner (multi‑key)
+Storage: Supabase (mutations & vetoes)
+Promotion: Active – accepted mutations are anchored to the sovereign ledger
+"""
+
 import os
+import asyncio
 import json
 import random
-import asyncio
-import httpx
 import logging
 from datetime import datetime
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from openai import AsyncOpenAI
-import google.generativeai as genai
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+import httpx
 from supabase import create_client, Client
+from pydantic import BaseModel, Field
 
-# --- LOGGING CONFIG ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("LROS-Sovereign-v86")
+# ------------------------------
+# Configuration
+# ------------------------------
+load_dotenv()
 
-app = FastAPI(title="LROS Engine 2: Sovereign v86.0")
+class Config:
+    # DeepSeek keys (comma separated)
+    DEEPSEEK_API_KEYS = [k.strip() for k in os.getenv("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
+    # Model keys
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+    MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+    # Supabase
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+    # Lung parameters
+    OMBUDSMAN_THRESHOLD = int(os.getenv("OMBUDSMAN_THRESHOLD", "95"))
+    MAX_CONCURRENT_AUDITS = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
+    WORKER_COUNT = int(os.getenv("WORKER_COUNT", "50"))
+    AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    # Optional: set to "debug" to see full proposal content
+    LOG_PROPOSALS = os.getenv("LOG_PROPOSALS", "false").lower() == "true"
 
-# --- MANDATE: ALLOW ALL CROSS-ORIGIN REQUESTS ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ------------------------------
+# Models (Pydantic)
+# ------------------------------
+class Proposal(BaseModel):
+    source: str          # model name (groq, cerebras, mistral)
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
-# --- CREDENTIALS & DB ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-HEART_API_URL = os.environ.get("HEART_API_URL")
+class AuditResult(BaseModel):
+    proposal_id: str
+    score: int
+    accepted: bool
+    reason: Optional[str] = None
 
-db: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
+class MutationRecord(BaseModel):
+    source: str
+    content: str
+    score: int
+    created_at: datetime
+    type: str = "mutation"
 
-# --- THE KEY VAULT & SANITIZER (Prevents Comma Errors) ---
-def get_clean_keys(env_var_name):
-    raw_string = os.environ.get(env_var_name, "")
-    if not raw_string: return []
-    return [k.strip() for k in raw_string.split(",") if k.strip()]
+# ------------------------------
+# Agent definitions (500)
+# ------------------------------
+MODELS = [
+    {"name": "groq", "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+     "model_id": "llama3-70b-8192", "api_key_var": "GROQ_API_KEY"},
+    {"name": "cerebras", "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+     "model_id": "llama3.1-70b", "api_key_var": "CEREBRAS_API_KEY"},
+    {"name": "mistral", "endpoint": "https://api.mistral.ai/v1/chat/completions",
+     "model_id": "mistral-large-latest", "api_key_var": "MISTRAL_API_KEY"}
+]
 
-DEEPSEEK_KEYS = get_clean_keys("DEEPSEEK_API_KEY")
-GEMINI_KEYS = get_clean_keys("GEMINI_API_KEY")
-GROQ_KEYS = get_clean_keys("GROQ_API_KEY")
-CEREBRAS_KEYS = get_clean_keys("CEREBRAS_API_KEY")
-MISTRAL_KEYS = get_clean_keys("MISTRAL_API_KEY")
+PROMPT_TEMPLATES = [
+    "Generate a strategic mutation for venture architecture optimization. Focus on capital efficiency.",
+    "Propose a novel medical protocol for exosome therapy efficiency. Include measurable KPIs.",
+    "Create a land valuation prediction model enhancement for Novus Terra. Use machine learning insights.",
+    "Develop a new business creation workflow with one‑button automation. Describe steps.",
+    "Optimize a Safemed clinical pathway for cost reduction without quality loss. List changes.",
+    "Suggest a novel way to integrate AI diagnostics with patient triage.",
+    "Propose a smart contract structure for tokenized real estate syndication.",
+    "Design a swarm‑based learning algorithm for autonomous medical record analysis.",
+    "Outline a competitive absorption strategy for a small health tech startup.",
+    "Create a constitutional clause to prevent AI drift in autonomous decision systems.",
+    "Generate a protocol for cross‑instance learning across sovereign AI nodes.",
+    "Propose a zero‑knowledge proof system for patient data consent.",
+    "Design a predictive maintenance schedule for autonomous drone fleets.",
+    "Outline a one‑button corporate entity creation flow with legal wrappers.",
+    "Suggest a novel approach to palliative care coordination using AI agents.",
+    "Create a tokenomics model for a health data marketplace.",
+    "Propose a method to detect and block AI hallucinations in real‑time.",
+    "Design a constitutional audit layer for autonomous financial transactions.",
+    "Generate a mutation that reduces latency in multi‑agent consensus protocols.",
+    "Outline a strategy for ingesting and synthesizing medical journals at scale.",
+]
 
-# --- LAYER 5400: DYNAMIC CLOUD MEMORY ---
-def get_memory():
-    if not db: return {"error": "Neural Link Severed"}
-    try:
-        res = db.table("sovereign_state").select("state_data").eq("id", 1).execute()
-        
-        # FORCED RECOVERY: If DB is empty, sync to Image 57a7e7.jpg truth
-        if not res.data:
-            initial_state = {
-                "baseline_anchor": 439434, 
-                "master_successes": 925176, 
-                "heart_successes": 485742, 
-                "lung_successes": 0,
-                "rejections": 52, 
-                "daily_learning": 5523.03,
-                "mutation_ledger": [],
-                "lung_logs": ["[MANDATE] Sovereign v86.0 Online. Ground Truth 925,176 Anchored."],
-                "node_performance": {"gemini": 0, "groq": 0, "cerebras": 0, "mistral": 0, "deepseek": 0}
+def generate_agents(count: int) -> List[Dict[str, Any]]:
+    agents = []
+    for i in range(count):
+        model = random.choice(MODELS)
+        prompt = random.choice(PROMPT_TEMPLATES)
+        agents.append({
+            "id": i,
+            "model_name": model["name"],
+            "endpoint": model["endpoint"],
+            "model_id": model["model_id"],
+            "api_key_var": model["api_key_var"],
+            "prompt": prompt,
+            "temperature": random.uniform(0.1, 0.3)
+        })
+    return agents
+
+AGENTS = generate_agents(Config.AGENT_COUNT)
+
+# ------------------------------
+# Proposer: generate proposal from agent
+# ------------------------------
+async def generate_proposal(agent: Dict[str, Any]) -> Proposal:
+    api_key = getattr(Config, agent["api_key_var"], None)
+    if not api_key:
+        raise ValueError(f"Missing API key for {agent['model_name']}")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {
+        "model": agent["model_id"],
+        "messages": [
+            {"role": "system", "content": "You are a strategic mutation generator. Output only the proposal content, no commentary."},
+            {"role": "user", "content": agent["prompt"]}
+        ],
+        "temperature": agent["temperature"],
+        "max_tokens": 500
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(agent["endpoint"], headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        if Config.LOG_PROPOSALS:
+            logging.debug(f"Proposal from {agent['model_name']}: {content[:200]}...")
+        return Proposal(source=agent["model_name"], content=content)
+
+# ------------------------------
+# Auditor: DeepSeek Ombudsman with key pool
+# ------------------------------
+AUDIT_PROMPT = """You are the Ombudsman, a strict logic auditor. You must evaluate the following proposal and assign a score from 0 to 100 based on:
+
+- Logical soundness (0‑30)
+- Novelty and strategic value (0‑30)
+- Alignment with sovereign constitutional principles (0‑20)
+- Practical feasibility (0‑20)
+
+Score 95+ to accept; below 95 is veto.
+
+Return ONLY a JSON object with keys: "score" (integer), "reason" (string, optional).
+
+Proposal to audit:
+"""
+
+class DeepSeekKeyPool:
+    def __init__(self, keys: List[str]):
+        self.keys = keys
+        self.index = 0
+        self.lock = asyncio.Lock()
+    async def get_key(self):
+        async with self.lock:
+            key = self.keys[self.index % len(self.keys)]
+            self.index += 1
+            return key
+
+key_pool = DeepSeekKeyPool(Config.DEEPSEEK_API_KEYS)
+
+async def audit_proposal(proposal: Proposal) -> AuditResult:
+    key = await key_pool.get_key()
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": "deepseek-reasoner",
+                "messages": [
+                    {"role": "system", "content": AUDIT_PROMPT},
+                    {"role": "user", "content": proposal.content}
+                ],
+                "temperature": 0.0,
+                "max_tokens": 200,
+                "response_format": {"type": "json_object"}
             }
-            db.table("sovereign_state").insert({"id": 1, "state_data": initial_state}).execute()
-            return initial_state
-        return res.data[0]["state_data"]
-    except Exception as e:
-        logger.error(f"Memory Retrieval Error: {e}")
-        return {"error": str(e)}
-
-def save_memory(state):
-    if db:
+        )
+        resp.raise_for_status()
+        data = resp.json()
         try:
-            db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
-        except Exception as e:
-            logger.error(f"Memory Save Error: {e}")
+            audit_json = json.loads(data["choices"][0]["message"]["content"])
+            score = int(audit_json.get("score", 0))
+            reason = audit_json.get("reason")
+        except (KeyError, json.JSONDecodeError, ValueError):
+            score = 0
+            reason = "Failed to parse audit response"
+        accepted = score >= Config.OMBUDSMAN_THRESHOLD
+        if Config.LOG_PROPOSALS:
+            logging.debug(f"Audit: score={score}, accepted={accepted}")
+        return AuditResult(
+            proposal_id=f"{proposal.source}_{proposal.timestamp.isoformat()}",
+            score=score,
+            accepted=accepted,
+            reason=reason
+        )
 
-# --- EVOLUTION TRIGGER: SECURE BASELINE ---
-@app.post("/api/lung/secure_baseline")
-async def secure_baseline():
-    state = get_memory()
-    if "error" in state: return state
+# ------------------------------
+# Storage: Supabase
+# ------------------------------
+_supabase: Optional[Client] = None
+
+def get_supabase() -> Client:
+    global _supabase
+    if _supabase is None:
+        _supabase = create_client(Config.SUPABASE_URL, Config.SUPABASE_KEY)
+    return _supabase
+
+def store_mutation(proposal: Proposal, audit: AuditResult):
+    if not audit.accepted:
+        return
+    supabase = get_supabase()
+    record = MutationRecord(
+        source=proposal.source,
+        content=proposal.content,
+        score=audit.score,
+        created_at=datetime.utcnow()
+    )
+    supabase.table("mutations").insert(record.model_dump()).execute()
+    logging.info(f"Stored mutation from {proposal.source} (score {audit.score})")
+
+def log_veto(proposal: Proposal, audit: AuditResult):
+    supabase = get_supabase()
+    supabase.table("vetoes").insert({
+        "source": proposal.source,
+        "content": proposal.content[:500],
+        "score": audit.score,
+        "reason": audit.reason,
+        "timestamp": datetime.utcnow().isoformat()
+    }).execute()
+    logging.info(f"Vetoed {proposal.source} (score {audit.score}): {audit.reason}")
+
+# ------------------------------
+# Self‑Play Worker
+# ------------------------------
+class SelfPlayWorker:
+    def __init__(self, agent: Dict[str, Any], audit_semaphore: asyncio.Semaphore):
+        self.agent = agent
+        self.audit_semaphore = audit_semaphore
+
+    async def run(self):
+        while True:
+            try:
+                proposal = await generate_proposal(self.agent)
+                async with self.audit_semaphore:
+                    audit = await audit_proposal(proposal)
+                if audit.accepted:
+                    store_mutation(proposal, audit)
+                else:
+                    log_veto(proposal, audit)
+                # Small delay to avoid overwhelming APIs
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logging.exception(f"Worker {self.agent['id']} error")
+                await asyncio.sleep(1)
+
+# ------------------------------
+# Main Entry Point
+# ------------------------------
+async def main():
+    logging.basicConfig(level=getattr(logging, Config.LOG_LEVEL))
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting LROS Lung Engine with {Config.WORKER_COUNT} workers, {Config.AGENT_COUNT} agents")
     
-    # Evolution: The current total becomes the new anchored floor.
-    # We clear active successes so the math starts fresh from the new floor.
-    state["baseline_anchor"] = state["master_successes"]
-    state["heart_successes"] = 0
-    state["lung_successes"] = 0
-    state["lung_logs"].append(f"[ANCHOR] Evolution Secured. New Baseline: {state['baseline_anchor']:,}")
+    if not Config.DEEPSEEK_API_KEYS:
+        raise ValueError("No DeepSeek API keys provided in DEEPSEEK_API_KEYS")
+    if not Config.SUPABASE_URL or not Config.SUPABASE_KEY:
+        raise ValueError("Supabase credentials missing")
     
-    save_memory(state)
-    return {"status": "success", "new_baseline": state["baseline_anchor"]}
+    audit_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_AUDITS)
+    workers = []
+    for i in range(Config.WORKER_COUNT):
+        agent = AGENTS[i % len(AGENTS)]
+        workers.append(SelfPlayWorker(agent, audit_semaphore))
+    
+    logger.info(f"Workers created. Lung is breathing. Ombudsman watching.")
+    await asyncio.gather(*[worker.run() for worker in workers])
 
-# --- RECONCILIATION LOOP (The Heartbeat) ---
-async def reconcile_memory():
-    while True:
-        try:
-            state = get_memory()
-            if "error" in state: 
-                await asyncio.sleep(10)
-                continue
-                
-            if HEART_API_URL:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(HEART_API_URL, timeout=10.0)
-                    if resp.status_code == 200:
-                        # Pull current Heart successes from External Engine 1
-                        state["heart_successes"] = resp.json().get("successes", state.get("heart_successes", 0))
-            
-            # IMMUTABLE FORMULA: Total = Anchor + Engine 1 + Engine 2
-            state["master_successes"] = state.get("baseline_anchor", 439434) + state["lung_successes"] + state["heart_successes"]
-            
-            save_memory(state)
-        except Exception as e:
-            logger.error(f"Reconciliation Error: {e}")
-        await asyncio.sleep(10)
-
-# --- EVOLUTION LOOP (The Breath) ---
-async def lung_evolution_cycle():
-    domains = ["Medical Protocol", "Venture Architecture", "Constitutional Alignment", "Novus Terra"]
-    while True:
-        try:
-            state = get_memory()
-            if "error" in state: 
-                await asyncio.sleep(15)
-                continue
-            
-            # Parallel Swarm: Select random available generator
-            available = [("gemini", "gemini-2.0-flash"), ("groq", "llama-3.3-70b-versatile")]
-            # Filter by keys actually present
-            valid_nodes = [n for n in available if get_clean_keys(f"{n[0].upper()}_API_KEY")]
-            
-            if not valid_nodes:
-                await asyncio.sleep(30)
-                continue
-
-            prov, mod = random.choice(valid_nodes)
-            
-            # Inculcating Veto Logic: DeepSeek (Ombudsman) must audit at 95%
-            # (Simplified for the Hard Reset stability)
-            state["lung_logs"].append(f"[SCAN] {prov.upper()} proposing {random.choice(domains)} optimization...")
-            
-            # Simulate a Veto to maintain your Veto count and strictness
-            state["rejections"] += 1
-            state["lung_logs"].append(f"[VETO] DeepSeek rejected {prov.upper()} drift. Score: 88%")
-            
-            if len(state["lung_logs"]) > 20: state["lung_logs"].pop(0)
-            save_memory(state)
-            
-        except Exception as e:
-            logger.error(f"Evolution Error: {e}")
-        await asyncio.sleep(45)
-
-@app.get("/api/lung/status")
-async def get_status():
-    return get_memory()
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(reconcile_memory())
-    asyncio.create_task(lung_evolution_cycle())
+if __name__ == "__main__":
+    asyncio.run(main())
