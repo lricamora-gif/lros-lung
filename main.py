@@ -1,18 +1,20 @@
-#!/usr/bin/env python3
 import os
 import json
 import random
 import asyncio
 import logging
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 import httpx
 from supabase import create_client
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
+# ---------- Configuration ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Lung")
 
-# --- Environment ---
 DEEPSEEK_KEYS = [k.strip() for k in os.getenv("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 CEREBRAS_KEY = os.getenv("CEREBRAS_API_KEY")
@@ -24,7 +26,7 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "50"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
 
-# --- Models (no Gemini) ---
+# ---------- Model definitions ----------
 MODELS = [
     {"name": "groq", "endpoint": "https://api.groq.com/openai/v1/chat/completions",
      "model_id": "llama3-70b-8192", "api_key": GROQ_KEY},
@@ -57,6 +59,7 @@ def generate_agents(count):
 
 AGENTS = generate_agents(AGENT_COUNT)
 
+# ---------- Helper functions ----------
 async def generate_proposal(agent):
     headers = {"Authorization": f"Bearer {agent['model']['api_key']}"}
     payload = {
@@ -142,6 +145,7 @@ def store_mutation(proposal, audit):
         }).execute()
         logger.info(f"Vetoed {proposal['source']} (score {audit['score']})")
 
+# ---------- Background worker ----------
 async def worker(agent, sem):
     while True:
         try:
@@ -154,14 +158,52 @@ async def worker(agent, sem):
             logger.exception(f"Worker {agent['id']} error")
             await asyncio.sleep(1)
 
-async def main():
+# ---------- FastAPI app ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start background swarm on startup
     logger.info(f"Lung starting: {WORKER_COUNT} workers, {AGENT_COUNT} agents")
     sem = asyncio.Semaphore(MAX_CONCURRENT)
     tasks = []
     for i in range(WORKER_COUNT):
         agent = AGENTS[i % len(AGENTS)]
         tasks.append(asyncio.create_task(worker(agent, sem)))
-    await asyncio.gather(*tasks)
+    app.state.tasks = tasks
+    yield
+    # Cleanup if needed
+    for t in tasks:
+        t.cancel()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def root():
+    return {"message": "LROS Lung Engine", "workers": WORKER_COUNT, "agents": AGENT_COUNT}
+
+@app.get("/status")
+async def status():
+    # Quick stats from Supabase (last 10 accepted and vetoed)
+    try:
+        recent_mutations = supabase.table("mutations").select("*").order("created_at", desc=True).limit(5).execute()
+        recent_vetoes = supabase.table("vetoes").select("*").order("timestamp", desc=True).limit(5).execute()
+        mutation_count = supabase.table("mutations").select("*", count="exact").execute().count
+        veto_count = supabase.table("vetoes").select("*", count="exact").execute().count
+    except Exception as e:
+        return {"error": str(e)}
+    return {
+        "workers": WORKER_COUNT,
+        "agents": AGENT_COUNT,
+        "threshold": THRESHOLD,
+        "mutations_total": mutation_count,
+        "vetoes_total": veto_count,
+        "recent_mutations": recent_mutations.data,
+        "recent_vetoes": recent_vetoes.data,
+    }
