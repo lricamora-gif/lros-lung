@@ -21,7 +21,6 @@ HEART_API_URL = os.environ.get("HEART_API_URL")
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
 # --- LAYER 5700: SWARM API CLIENTS ---
-# All except Gemini use the OpenAI compatible client for unified code
 clients = {
     "deepseek": AsyncOpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com"),
     "groq": AsyncOpenAI(api_key=os.environ.get("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1"),
@@ -32,10 +31,25 @@ clients = {
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 gemini_client = genai.GenerativeModel('gemini-2.5-flash')
 
-# --- LAYER 5400: CLOUD MEMORY ---
+# --- LAYER 5400: CLOUD MEMORY (WITH AUTO-SEED) ---
 def get_memory():
     if not db: raise Exception("Supabase DB not connected.")
     res = db.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    
+    # BULLETPROOF FIX: Auto-initialize if Supabase is empty
+    if not res.data:
+        default_state = {
+            "master_successes": 238245,
+            "heart_successes": 0,
+            "lung_successes": 0,
+            "daily_learning": 5523.03,
+            "rejections": 0,
+            "mutation_ledger": [],
+            "lung_logs": ["🚀 Lung Engine 2 Online. Auto-Seeded Vault."]
+        }
+        db.table("sovereign_state").insert({"id": 1, "state_data": default_state}).execute()
+        return default_state
+        
     return res.data[0]["state_data"]
 
 def save_memory(state):
@@ -44,7 +58,6 @@ def save_memory(state):
 
 # --- LOAD BALANCER & EXECUTION LOGIC ---
 async def call_llm(provider: str, model: str, prompt: str, system_prompt: str = "You are LROS."):
-    """Standardized API caller with error handling to protect limits."""
     try:
         if provider == "gemini":
             return gemini_client.generate_content(f"{system_prompt}\n\n{prompt}").text
@@ -54,14 +67,15 @@ async def call_llm(provider: str, model: str, prompt: str, system_prompt: str = 
                 model=model,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
             )
-            return res.choices[0].message.content
+            # Safety net to prevent API index errors
+            if res.choices and len(res.choices) > 0:
+                return res.choices[0].message.content
+            return None
     except Exception as e:
-        logger.warning(f"[{provider}] Limit/Error: {e}")
-        return None # Returns None so the router knows to fallback
+        logger.warning(f"[{provider}] API Limit/Error: {e}")
+        return None
 
 async def swarm_consensus(prompt: str):
-    """Parallel Mode: Fires 4 APIs at once. DeepSeek audits the results and picks the best."""
-    # 1. Fire Cerebras, Groq, Mistral, and Gemini simultaneously
     tasks = [
         call_llm("cerebras", "llama3.1-70b", prompt),
         call_llm("groq", "llama-3.3-70b-versatile", prompt),
@@ -71,15 +85,14 @@ async def swarm_consensus(prompt: str):
     results = await asyncio.gather(*tasks)
     
     valid_results = [r for r in results if r is not None]
-    if not valid_results: return "Swarm Overload: All generation nodes hit rate limits."
+    if not valid_results: return "Swarm Overload: APIs rate-limited."
 
-    # 2. DeepSeek acts as the Ombudsman to pick the best response
-    audit_prompt = f"Review these {len(valid_results)} agent responses to the prompt: '{prompt}'. Synthesize the ultimate, most accurate executive answer from them. Responses: {valid_results}"
+    audit_prompt = f"Review these {len(valid_results)} agent responses to: '{prompt}'. Synthesize the ultimate answer. Responses: {valid_results}"
     final_answer = await call_llm("deepseek", "deepseek-reasoner", audit_prompt)
     
     return final_answer if final_answer else valid_results[0]
 
-# --- BACKGROUND EVOLUTION (Runs 24/7) ---
+# --- BACKGROUND EVOLUTION ---
 async def reconcile_memory():
     while True:
         try:
@@ -88,28 +101,28 @@ async def reconcile_memory():
                 async with httpx.AsyncClient() as client:
                     resp = await client.get(HEART_API_URL, timeout=10.0)
                     if resp.status_code == 200:
-                        state["heart_successes"] = resp.json().get("successes", state["heart_successes"])
+                        state["heart_successes"] = resp.json().get("successes", state.get("heart_successes", 0))
                         state["master_successes"] = 238245 + state["lung_successes"] + state["heart_successes"]
                         save_memory(state)
-        except Exception: pass
+        except Exception as e:
+            pass # Fails silently without crashing the logs if Heart is asleep
         await asyncio.sleep(10)
 
 async def lung_evolution_cycle():
-    """Delegates ideation to fast models, saves DeepSeek limits for scoring."""
     domains = ["Medical Protocol", "Novus Terra Asset", "Venture Architecture", "Constitutional Alignment"]
     while True:
         try:
             state = get_memory()
             domain = random.choice(domains)
             
-            # 1. Generate Hypothesis (Rotate APIs to avoid rate limits)
             providers = [("cerebras", "llama3.1-70b"), ("groq", "llama-3.3-70b-versatile"), ("mistral", "mistral-large-latest")]
             prov, mod = random.choice(providers)
             hypothesis = await call_llm(prov, mod, f"Generate a 1-paragraph optimization strategy for {domain}.")
             
-            if not hypothesis: continue # Skip cycle if rate limited
+            if not hypothesis: 
+                await asyncio.sleep(15)
+                continue
             
-            # 2. DeepSeek Audits the Hypothesis
             score_prompt = f"Audit this strategy: {hypothesis}. Score strictly 0-100 based on ROI and logic. Return ONLY the integer."
             audit_res = await call_llm("deepseek", "deepseek-chat", score_prompt)
             
@@ -117,7 +130,6 @@ async def lung_evolution_cycle():
                 audit_score = int(''.join(filter(str.isdigit, audit_res))) if audit_res else 0
             except: audit_score = 0
 
-            # 3. Save to Ledger
             if audit_score >= 95:
                 state["lung_successes"] += 1
                 state["master_successes"] = 238245 + state["lung_successes"] + state.get("heart_successes", 0)
@@ -144,7 +156,7 @@ async def lung_evolution_cycle():
         except Exception as e:
             logger.error(f"Evolution Loop Error: {e}")
             
-        await asyncio.sleep(45) # 45s pacing prevents rapid API exhaustion
+        await asyncio.sleep(45) 
 
 # --- FRONTEND API ENDPOINTS ---
 class MultiAIChat(BaseModel):
@@ -153,21 +165,17 @@ class MultiAIChat(BaseModel):
 
 @app.post("/api/lung/chat")
 async def multi_ai_chat(req: MultiAIChat):
-    """Routes your frontend chat requests."""
     mode = req.mode.lower()
     
     if mode == "parallel":
         response = await swarm_consensus(req.prompt)
     elif mode == "chain":
-        # DeepSeek reasons, Gemini synthesizes
         reasoning = await call_llm("deepseek", "deepseek-reasoner", req.prompt)
         response = await call_llm("gemini", "gemini-2.5-flash", f"Format this reasoning into an executive summary:\n{reasoning}")
     elif mode in ["deepseek", "groq", "cerebras", "mistral", "gemini"]:
-        # Direct model call
         models = {"deepseek": "deepseek-reasoner", "groq": "llama-3.3-70b-versatile", "cerebras": "llama3.1-70b", "mistral": "mistral-large-latest"}
         response = await call_llm(mode, models.get(mode, ""), req.prompt)
     else:
-        # Auto Mode: Complexity routing
         if len(req.prompt) > 200:
             response = await call_llm("mistral", "mistral-large-latest", req.prompt)
         else:
