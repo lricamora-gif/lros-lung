@@ -1,0 +1,31 @@
+services:
+  - type: worker
+    name: lros-lung-engine
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: DEEPSEEK_API_KEYS
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: OMBUDSMAN_THRESHOLD
+        value: 95
+      - key: MAX_CONCURRENT_AUDITS
+        value: 10
+      - key: WORKER_COUNT
+        value: 50
+      - key: AGENT_COUNT
+        value: 500
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_PROPOSALS
+        value: false
