@@ -22,11 +22,14 @@ def get_key_list(var_name):
     value = os.getenv(var_name, "")
     return [k.strip() for k in value.split(",") if k.strip()]
 
+# DeepSeek keys – these will be used for both generation and audit
 DEEPSEEK_KEYS = get_key_list("DEEPSEEK_API_KEYS")
+
+# Other keys (currently not used, but kept for future extension)
 GROQ_KEYS   = get_key_list("GROQ_API_KEYS")
 CEREBRAS_KEYS = get_key_list("CEREBRAS_API_KEYS")
 MISTRAL_KEYS = get_key_list("MISTRAL_API_KEYS")
-GEMINI_KEYS = get_key_list("GEMINI_API_KEYS")          # added Gemini
+GEMINI_KEYS = get_key_list("GEMINI_API_KEYS")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -36,86 +39,33 @@ WORKER_COUNT = int(os.getenv("WORKER_COUNT", "50"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "60"))
 
-# ---------- KeyPool with health checking ----------
+# ---------- KeyPool with health tracking (simplified) ----------
 class KeyPool:
     def __init__(self, keys):
-        self.keys = keys.copy()          # mutable list
+        self.keys = keys
         self.index = 0
         self.lock = asyncio.Lock()
-        self.health_status = {k: True for k in keys}   # initially assume healthy
     async def get(self):
         if not self.keys:
             return None
         async with self.lock:
-            # cycle through keys, skip unhealthy ones
-            start = self.index
-            while True:
-                idx = self.index % len(self.keys)
-                key = self.keys[idx]
-                self.index = (self.index + 1) % len(self.keys)
-                if self.health_status.get(key, True):
-                    return key
-                if idx == start % len(self.keys):
-                    # all keys are unhealthy
-                    return None
-    def mark_unhealthy(self, key):
-        if key in self.health_status:
-            self.health_status[key] = False
-            logger.warning(f"Key marked unhealthy: {key[:10]}...")
-    def mark_healthy(self, key):
-        if key in self.health_status:
-            self.health_status[key] = True
-    async def test_key(self, key):
-        """Test a single key with a lightweight API call."""
-        try:
-            # For DeepSeek, Groq, etc. – use a generic test call
-            # We'll implement per-model tests later; for now just assume OK
-            # Actually we'll do a minimal test for each type separately
-            # Since we don't know the model type here, we'll skip detailed test
-            return True
-        except:
-            return False
+            k = self.keys[self.index % len(self.keys)]
+            self.index += 1
+            return k
 
-# ---------- Model definitions (including Gemini) ----------
+# ---------- Model definitions – only DeepSeek for now ----------
 MODELS = []
-if GROQ_KEYS:
+
+# Add DeepSeek as proposer (it can also act as auditor, but we separate)
+if DEEPSEEK_KEYS:
     MODELS.append({
-        "name": "groq",
-        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
-        "model_id": "llama3-70b-8192",
-        "key_pool": KeyPool(GROQ_KEYS),
-        "test_endpoint": "https://api.groq.com/openai/v1/chat/completions",
-        "test_payload": {"model": "llama3-70b-8192", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
+        "name": "deepseek",
+        "endpoint": "https://api.deepseek.com/v1/chat/completions",
+        "model_id": "deepseek-chat",          # Use chat model for generation (faster/cheaper)
+        "key_pool": KeyPool(DEEPSEEK_KEYS)
     })
-if CEREBRAS_KEYS:
-    MODELS.append({
-        "name": "cerebras",
-        "endpoint": "https://api.cerebras.ai/v1/chat/completions",
-        "model_id": "llama3.1-70b",
-        "key_pool": KeyPool(CEREBRAS_KEYS),
-        "test_endpoint": "https://api.cerebras.ai/v1/chat/completions",
-        "test_payload": {"model": "llama3.1-70b", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
-    })
-if MISTRAL_KEYS:
-    MODELS.append({
-        "name": "mistral",
-        "endpoint": "https://api.mistral.ai/v1/chat/completions",
-        "model_id": "mistral-large-latest",
-        "key_pool": KeyPool(MISTRAL_KEYS),
-        "test_endpoint": "https://api.mistral.ai/v1/chat/completions",
-        "test_payload": {"model": "mistral-large-latest", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
-    })
-if GEMINI_KEYS:
-    # Gemini uses a different endpoint (Google AI Studio)
-    # We'll use the REST endpoint for simplicity
-    MODELS.append({
-        "name": "gemini",
-        "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent",
-        "model_id": "gemini-2.0-flash-exp",
-        "key_pool": KeyPool(GEMINI_KEYS),
-        "test_endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent",
-        "test_payload": {"contents": [{"parts": [{"text": "test"}]}]}
-    })
+
+# (Other models can be added here later when they work)
 
 PROMPTS = [
     "Generate a strategic mutation for venture architecture optimization.",
@@ -142,7 +92,7 @@ def generate_agents(count):
 
 AGENTS = generate_agents(AGENT_COUNT)
 
-# ---------- Proposal generation with retry ----------
+# ---------- Proposal generation using DeepSeek (with retry) ----------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)))
 async def _generate_proposal(agent):
@@ -150,33 +100,20 @@ async def _generate_proposal(agent):
     if not key:
         raise ValueError(f"No API key for {agent['model']['name']}")
     headers = {"Authorization": f"Bearer {key}"}
-    if agent["model"]["name"] == "gemini":
-        # Gemini uses API key in query parameter
-        url = f"{agent['model']['endpoint']}?key={key}"
-        headers = {}  # no Authorization header
-        payload = agent["model"]["test_payload"]  # use same payload structure
-        # Adjust payload for Gemini: it expects {contents: [...]}
-        payload = {"contents": [{"parts": [{"text": agent["prompt"]}]}]}
-    else:
-        url = agent["model"]["endpoint"]
-        payload = {
-            "model": agent["model"]["model_id"],
-            "messages": [
-                {"role": "system", "content": "You are a strategic mutation generator. Output only the proposal content."},
-                {"role": "user", "content": agent["prompt"]}
-            ],
-            "temperature": agent["temperature"],
-            "max_tokens": 500
-        }
+    payload = {
+        "model": agent["model"]["model_id"],
+        "messages": [
+            {"role": "system", "content": "You are a strategic mutation generator. Output only the proposal content."},
+            {"role": "user", "content": agent["prompt"]}
+        ],
+        "temperature": agent["temperature"],
+        "max_tokens": 500
+    }
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, headers=headers, json=payload)
+        resp = await client.post(agent["model"]["endpoint"], headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        if agent["model"]["name"] == "gemini":
-            # Extract text from Gemini response
-            content = data["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            content = data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
         return {"source": agent["model"]["name"], "content": content, "timestamp": datetime.utcnow()}
 
 async def generate_proposal(agent):
@@ -184,19 +121,10 @@ async def generate_proposal(agent):
         return await _generate_proposal(agent)
     except Exception as e:
         logger.error(f"Proposal generation failed for {agent['model']['name']}: {e}")
-        # Mark the key used as potentially bad (we can't know which key, so we skip)
-        # Instead, we'll rely on the health monitor to test keys periodically
-        if len(MODELS) > 1:
-            # Try a different model
-            alt_model = random.choice([m for m in MODELS if m != agent['model']])
-            logger.info(f"Switching to alternative model {alt_model['name']}")
-            agent = dict(agent)
-            agent["model"] = alt_model
-            return await _generate_proposal(agent)
-        else:
-            raise
+        # If we had other models, we could try them; but for now just re-raise
+        raise
 
-# ---------- Ombudsman audit with retry ----------
+# ---------- Ombudsman audit using DeepSeek Reasoner (with retry) ----------
 deepseek_pool = KeyPool(DEEPSEEK_KEYS)
 
 AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
@@ -304,7 +232,6 @@ async def worker(agent, sem):
 async def health_monitor(app: FastAPI):
     while True:
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-        # Check if workers are running
         tasks = getattr(app.state, 'tasks', None)
         if tasks:
             alive = [t for t in tasks if not t.done()]
@@ -323,7 +250,6 @@ async def health_monitor(app: FastAPI):
                 app.state.tasks = new_tasks
                 logger.info(f"Restarted {len(new_tasks)} workers")
         else:
-            # No workers started yet – try to start if components ready
             if MODELS and deepseek_pool.keys and supabase:
                 logger.info("Workers not running, starting fresh...")
                 sem = asyncio.Semaphore(MAX_CONCURRENT)
@@ -339,12 +265,10 @@ async def health_monitor(app: FastAPI):
 # ---------- FastAPI app ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Debug log
     logger.info(f"MODELS count: {len(MODELS)}, DeepSeek keys: {len(deepseek_pool.keys) if deepseek_pool else 0}, Supabase: {supabase is not None}")
     if not MODELS or not deepseek_pool.keys or not supabase:
         logger.warning("Missing required services. Workers will not start until all are available.")
     else:
-        # Start initial workers
         sem = asyncio.Semaphore(MAX_CONCURRENT)
         tasks = []
         for i in range(WORKER_COUNT):
@@ -355,13 +279,11 @@ async def lifespan(app: FastAPI):
         app.state.tasks = tasks
         logger.info(f"Started {len(tasks)} workers")
 
-    # Start health monitor
     monitor_task = asyncio.create_task(health_monitor(app))
     app.state.monitor_task = monitor_task
 
     yield
 
-    # Cleanup
     if hasattr(app.state, 'tasks'):
         for t in app.state.tasks:
             t.cancel()
@@ -394,12 +316,11 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Detailed health check for monitoring."""
     return {
         "models": {
             "count": len(MODELS),
             "names": [m["name"] for m in MODELS],
-            "keys_available": sum(1 for m in MODELS if m["key_pool"].keys)
+            "keys_available": all(m["key_pool"].keys for m in MODELS)
         },
         "deepseek_keys": len(deepseek_pool.keys),
         "supabase": supabase is not None,
@@ -443,7 +364,6 @@ async def secure_baseline(data: BaselineUpdate):
 
 @app.post("/reset_workers")
 async def reset_workers():
-    """Manually restart worker tasks."""
     if not hasattr(app.state, 'tasks'):
         raise HTTPException(status_code=400, detail="No workers running")
     for t in app.state.tasks:
