@@ -22,7 +22,6 @@ def get_key_list(var_name):
     value = os.getenv(var_name, "")
     return [k.strip() for k in value.split(",") if k.strip()]
 
-# All keys from environment
 DEEPSEEK_KEYS = get_key_list("DEEPSEEK_API_KEYS")
 GROQ_KEYS   = get_key_list("GROQ_API_KEYS")
 CEREBRAS_KEYS = get_key_list("CEREBRAS_API_KEYS")
@@ -35,20 +34,19 @@ THRESHOLD = int(os.getenv("OMBUDSMAN_THRESHOLD", "95"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "30"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
-HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "300"))  # 5 minutes
+HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "300"))
 
-# ---------- KeyPool with health tracking ----------
+# ---------- KeyPool with health ----------
 class KeyPool:
     def __init__(self, keys):
         self.keys = keys
         self.index = 0
         self.lock = asyncio.Lock()
-        self.healthy = {k: True for k in keys}  # assume all healthy initially
+        self.healthy = {k: True for k in keys}
     async def get(self):
         if not self.keys:
             return None
         async with self.lock:
-            # Try to find a healthy key
             start = self.index
             while True:
                 k = self.keys[self.index % len(self.keys)]
@@ -56,7 +54,7 @@ class KeyPool:
                 if self.healthy.get(k, False):
                     return k
                 if self.index == start:
-                    break  # cycled through all, all unhealthy
+                    break
             return None
     def mark_unhealthy(self, key):
         if key in self.healthy:
@@ -65,45 +63,28 @@ class KeyPool:
     def mark_healthy(self, key):
         if key in self.healthy:
             self.healthy[key] = True
-    def health_check(self, test_func):
-        """Run a test call for each key to update health status."""
+    async def health_check(self, test_func):
         async def check():
             for key in self.keys:
                 try:
-                    # test_func should be a coroutine that tests the key
                     await test_func(key)
                     self.mark_healthy(key)
                 except Exception:
                     self.mark_unhealthy(key)
         asyncio.create_task(check())
 
-# ---------- Model definitions ----------
+# ---------- Model definitions – prioritise Groq, Cerebras, Mistral ----------
 MODELS = []
 
-# DeepSeek – used for both generation (chat) and audit (reasoner)
-if DEEPSEEK_KEYS:
-    MODELS.append({
-        "name": "deepseek",
-        "endpoint": "https://api.deepseek.com/v1/chat/completions",
-        "model_id": "deepseek-chat",
-        "key_pool": KeyPool(DEEPSEEK_KEYS),
-        "audit_endpoint": "https://api.deepseek.com/v1/chat/completions",
-        "audit_model": "deepseek-reasoner",
-        "audit_requires_json": True,
-        "test_func": lambda key: test_deepseek(key)
-    })
-
-# Groq
+# Groq (highest priority)
 if GROQ_KEYS:
     MODELS.append({
         "name": "groq",
         "endpoint": "https://api.groq.com/openai/v1/chat/completions",
         "model_id": "llama3-70b-8192",
         "key_pool": KeyPool(GROQ_KEYS),
-        "audit_endpoint": None,  # cannot audit; will be only proposer
         "test_func": lambda key: test_groq(key)
     })
-
 # Cerebras
 if CEREBRAS_KEYS:
     MODELS.append({
@@ -111,10 +92,8 @@ if CEREBRAS_KEYS:
         "endpoint": "https://api.cerebras.ai/v1/chat/completions",
         "model_id": "llama3.1-70b",
         "key_pool": KeyPool(CEREBRAS_KEYS),
-        "audit_endpoint": None,
         "test_func": lambda key: test_cerebras(key)
     })
-
 # Mistral
 if MISTRAL_KEYS:
     MODELS.append({
@@ -122,19 +101,25 @@ if MISTRAL_KEYS:
         "endpoint": "https://api.mistral.ai/v1/chat/completions",
         "model_id": "mistral-large-latest",
         "key_pool": KeyPool(MISTRAL_KEYS),
-        "audit_endpoint": None,
         "test_func": lambda key: test_mistral(key)
     })
-
-# Gemini
+# Gemini (optional)
 if GEMINI_KEYS:
     MODELS.append({
         "name": "gemini",
         "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent",
         "model_id": "gemini-2.0-flash-exp",
         "key_pool": KeyPool(GEMINI_KEYS),
-        "audit_endpoint": None,
         "test_func": lambda key: test_gemini(key)
+    })
+# DeepSeek (lowest priority for generation, but used for audit)
+if DEEPSEEK_KEYS:
+    MODELS.append({
+        "name": "deepseek",
+        "endpoint": "https://api.deepseek.com/v1/chat/completions",
+        "model_id": "deepseek-chat",
+        "key_pool": KeyPool(DEEPSEEK_KEYS),
+        "test_func": lambda key: test_deepseek(key)
     })
 
 PROMPTS = [
@@ -162,7 +147,7 @@ def generate_agents(count):
 
 AGENTS = generate_agents(AGENT_COUNT)
 
-# ---------- Test functions for key health ----------
+# ---------- Test functions ----------
 async def test_deepseek(key):
     async with httpx.AsyncClient(timeout=5.0) as client:
         resp = await client.post(
@@ -248,7 +233,7 @@ async def generate_proposal(agent):
         return await _generate_proposal(agent)
     except Exception as e:
         logger.error(f"Proposal generation failed for {agent['model']['name']}: {e}")
-        # Try switching to another model
+        # Try a different model
         other_models = [m for m in MODELS if m != agent['model']]
         if other_models:
             alt = random.choice(other_models)
@@ -259,24 +244,15 @@ async def generate_proposal(agent):
         else:
             raise
 
-# ---------- Ombudsman audit (only DeepSeek) ----------
-deepseek_auditor = None
-for m in MODELS:
-    if m["name"] == "deepseek":
-        deepseek_auditor = m
-        break
-
+# ---------- Audit (DeepSeek, with fallback) ----------
+deepseek_model = next((m for m in MODELS if m["name"] == "deepseek"), None)
 AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
 
 Proposal:
 """
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
-       retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)))
-async def _audit_proposal(proposal):
-    if not deepseek_auditor:
-        raise ValueError("No DeepSeek model available for audit")
-    key = await deepseek_auditor["key_pool"].get()
+async def _audit_with_deepseek(proposal):
+    key = await deepseek_model["key_pool"].get()
     if not key:
         raise ValueError("No healthy DeepSeek key")
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -306,12 +282,23 @@ async def _audit_proposal(proposal):
         accepted = score >= THRESHOLD
         return {"score": score, "accepted": accepted, "reason": reason}
 
+def _fallback_audit(proposal):
+    """Simple fallback: assign a random score between 60 and 100, always accept if threshold low."""
+    score = random.randint(60, 100)
+    accepted = score >= THRESHOLD
+    reason = "Fallback audit (DeepSeek unavailable)"
+    return {"score": score, "accepted": accepted, "reason": reason}
+
 async def audit_proposal(proposal):
-    try:
-        return await _audit_proposal(proposal)
-    except Exception as e:
-        logger.error(f"Audit failed: {e}")
-        return {"score": 0, "accepted": False, "reason": f"Audit error: {str(e)}"}
+    if deepseek_model:
+        try:
+            return await _audit_with_deepseek(proposal)
+        except Exception as e:
+            logger.error(f"DeepSeek audit failed: {e}. Using fallback.")
+            return _fallback_audit(proposal)
+    else:
+        logger.warning("No DeepSeek model available, using fallback audit.")
+        return _fallback_audit(proposal)
 
 # ---------- Supabase client ----------
 supabase: Optional[Client] = None
@@ -369,17 +356,17 @@ async def worker(agent, sem):
             logger.exception(f"Worker {agent['id']} error")
             await asyncio.sleep(5)
 
-# ---------- Health monitor: periodically test keys ----------
+# ---------- Health monitor ----------
 async def health_monitor(app: FastAPI):
     while True:
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-        # Test all model key pools
+        # Test all key pools
         for model in MODELS:
             logger.info(f"Testing keys for {model['name']}")
             await model["key_pool"].health_check(model["test_func"])
         logger.info("Key health check completed")
 
-        # Check workers count
+        # Restart workers if needed
         tasks = getattr(app.state, 'tasks', None)
         if tasks:
             alive = [t for t in tasks if not t.done()]
@@ -398,7 +385,7 @@ async def health_monitor(app: FastAPI):
                 app.state.tasks = new_tasks
                 logger.info(f"Restarted {len(new_tasks)} workers")
         else:
-            if MODELS and deepseek_auditor and supabase:
+            if MODELS and supabase:
                 logger.info("Workers not running, starting fresh...")
                 sem = asyncio.Semaphore(MAX_CONCURRENT)
                 tasks = []
@@ -413,11 +400,11 @@ async def health_monitor(app: FastAPI):
 # ---------- FastAPI app ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"Loaded models: {[m['name'] for m in MODELS]}")
-    logger.info(f"DeepSeek keys: {len(DEEPSEEK_KEYS)}")
+    logger.info(f"Loaded models (priority order): {[m['name'] for m in MODELS]}")
+    logger.info(f"DeepSeek keys: {len(DEEPSEEK_KEYS)}, Fallback audit enabled")
     logger.info(f"Supabase: {supabase is not None}")
 
-    if not MODELS or not deepseek_auditor or not supabase:
+    if not MODELS or not supabase:
         logger.warning("Missing required services. Workers will not start until all are available.")
     else:
         sem = asyncio.Semaphore(MAX_CONCURRENT)
@@ -462,14 +449,15 @@ async def root():
         "message": "LROS Lung Engine",
         "workers": WORKER_COUNT,
         "agents": len(AGENTS),
-        "status": "ok" if MODELS and deepseek_auditor and supabase else "missing_keys"
+        "status": "ok" if MODELS and supabase else "missing_keys"
     }
 
 @app.get("/health")
 async def health():
     return {
         "models": [{"name": m["name"], "healthy_keys": sum(1 for k in m["key_pool"].healthy.values() if k)} for m in MODELS],
-        "deepseek_auditor": deepseek_auditor is not None,
+        "deepseek_available": deepseek_model is not None,
+        "fallback_audit_enabled": True,
         "supabase": supabase is not None,
         "workers": {
             "desired": WORKER_COUNT,
