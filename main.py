@@ -15,28 +15,19 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Lung")
 
-# Required environment variables
-REQUIRED_KEYS = [
-    "DEEPSEEK_API_KEYS",
-    "GROQ_API_KEY",
-    "CEREBRAS_API_KEY",
-    "MISTRAL_API_KEY",
-    "SUPABASE_URL",
-    "SUPABASE_KEY"
-]
+# --- Multi‑key helpers ---
+def get_key_list(var_name):
+    value = os.getenv(var_name, "")
+    return [k.strip() for k in value.split(",") if k.strip()]
 
-missing = [k for k in REQUIRED_KEYS if not os.getenv(k)]
-if missing:
-    logger.error(f"Missing required environment variables: {', '.join(missing)}")
-    logger.error("Please add them in Render dashboard under Environment.")
-    # We'll still start the web service, but background workers will not run.
-    # This allows the status endpoint to show an error.
+# DeepSeek keys
+DEEPSEEK_KEYS = get_key_list("DEEPSEEK_API_KEYS")
 
-# Parse keys
-DEEPSEEK_KEYS = [k.strip() for k in os.getenv("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
-GROQ_KEY = os.getenv("GROQ_API_KEY")
-CEREBRAS_KEY = os.getenv("CEREBRAS_API_KEY")
-MISTRAL_KEY = os.getenv("MISTRAL_API_KEY")
+# Model keys (each can be a comma‑separated list)
+GROQ_KEYS   = get_key_list("GROQ_API_KEY")
+CEREBRAS_KEYS = get_key_list("CEREBRAS_API_KEY")
+MISTRAL_KEYS = get_key_list("MISTRAL_API_KEY")
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 THRESHOLD = int(os.getenv("OMBUDSMAN_THRESHOLD", "95"))
@@ -44,17 +35,43 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "50"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
 
-# ---------- Model definitions (only if keys exist) ----------
+# --- Model definitions (with key pools) ---
+class KeyPool:
+    def __init__(self, keys):
+        self.keys = keys
+        self.index = 0
+        self.lock = asyncio.Lock()
+    async def get(self):
+        if not self.keys:
+            return None
+        async with self.lock:
+            k = self.keys[self.index % len(self.keys)]
+            self.index += 1
+            return k
+
+# Build model list only if keys exist
 MODELS = []
-if GROQ_KEY:
-    MODELS.append({"name": "groq", "endpoint": "https://api.groq.com/openai/v1/chat/completions",
-                   "model_id": "llama3-70b-8192", "api_key": GROQ_KEY})
-if CEREBRAS_KEY:
-    MODELS.append({"name": "cerebras", "endpoint": "https://api.cerebras.ai/v1/chat/completions",
-                   "model_id": "llama3.1-70b", "api_key": CEREBRAS_KEY})
-if MISTRAL_KEY:
-    MODELS.append({"name": "mistral", "endpoint": "https://api.mistral.ai/v1/chat/completions",
-                   "model_id": "mistral-large-latest", "api_key": MISTRAL_KEY})
+if GROQ_KEYS:
+    MODELS.append({
+        "name": "groq",
+        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+        "model_id": "llama3-70b-8192",
+        "key_pool": KeyPool(GROQ_KEYS)
+    })
+if CEREBRAS_KEYS:
+    MODELS.append({
+        "name": "cerebras",
+        "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+        "model_id": "llama3.1-70b",
+        "key_pool": KeyPool(CEREBRAS_KEYS)
+    })
+if MISTRAL_KEYS:
+    MODELS.append({
+        "name": "mistral",
+        "endpoint": "https://api.mistral.ai/v1/chat/completions",
+        "model_id": "mistral-large-latest",
+        "key_pool": KeyPool(MISTRAL_KEYS)
+    })
 
 PROMPTS = [
     "Generate a strategic mutation for venture architecture optimization.",
@@ -81,9 +98,12 @@ def generate_agents(count):
 
 AGENTS = generate_agents(AGENT_COUNT)
 
-# ---------- Helper functions ----------
+# ---------- Proposal generation ----------
 async def generate_proposal(agent):
-    headers = {"Authorization": f"Bearer {agent['model']['api_key']}"}
+    key = await agent["model"]["key_pool"].get()
+    if not key:
+        raise ValueError(f"No API key for {agent['model']['name']}")
+    headers = {"Authorization": f"Bearer {key}"}
     payload = {
         "model": agent["model"]["model_id"],
         "messages": [
@@ -100,28 +120,18 @@ async def generate_proposal(agent):
         content = data["choices"][0]["message"]["content"]
         return {"source": agent["model"]["name"], "content": content, "timestamp": datetime.utcnow()}
 
+# ---------- Ombudsman (DeepSeek) with key pool ----------
 AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
 
 Proposal:
 """
 
-class KeyPool:
-    def __init__(self, keys):
-        self.keys = keys
-        self.index = 0
-        self.lock = asyncio.Lock()
-    async def get(self):
-        async with self.lock:
-            k = self.keys[self.index % len(self.keys)]
-            self.index += 1
-            return k
-
-key_pool = KeyPool(DEEPSEEK_KEYS) if DEEPSEEK_KEYS else None
+deepseek_pool = KeyPool(DEEPSEEK_KEYS)
 
 async def audit_proposal(proposal):
-    if not key_pool:
+    key = await deepseek_pool.get()
+    if not key:
         return {"score": 0, "accepted": False, "reason": "No DeepSeek keys"}
-    key = await key_pool.get()
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.deepseek.com/v1/chat/completions",
@@ -148,7 +158,7 @@ async def audit_proposal(proposal):
         accepted = score >= THRESHOLD
         return {"score": score, "accepted": accepted, "reason": reason}
 
-# Supabase client (only if credentials exist)
+# ---------- Supabase storage ----------
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -190,8 +200,9 @@ async def worker(agent, sem):
 # ---------- FastAPI app ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not MODELS or not key_pool or not supabase:
-        logger.warning("Missing required services. Background workers will not start.")
+    # Start workers only if all required pieces are present
+    if not MODELS or not deepseek_pool.keys or not supabase:
+        logger.warning("Missing required services (models, DeepSeek keys, or Supabase). Workers not started.")
         yield
         return
     logger.info(f"Lung starting: {WORKER_COUNT} workers, {AGENT_COUNT} agents")
@@ -208,7 +219,6 @@ async def lifespan(app: FastAPI):
         t.cancel()
 
 app = FastAPI(lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -219,7 +229,12 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"message": "LROS Lung Engine", "workers": WORKER_COUNT, "agents": len(AGENTS), "status": "ok" if MODELS and key_pool and supabase else "missing_keys"}
+    return {
+        "message": "LROS Lung Engine",
+        "workers": WORKER_COUNT,
+        "agents": len(AGENTS),
+        "status": "ok" if MODELS and deepseek_pool.keys and supabase else "missing_keys"
+    }
 
 @app.get("/status")
 async def status():
