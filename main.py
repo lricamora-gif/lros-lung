@@ -84,7 +84,7 @@ if GROQ_KEYS:
     MODELS.append({
         "name": "groq",
         "endpoint": "https://api.groq.com/openai/v1/chat/completions",
-        "model_id": "llama3-70b-8192",
+        "model_id": "llama-3.1-70b-versatile",   # FIXED: updated model name
         "key_pool": KeyPool(GROQ_KEYS),
         "test_func": lambda key: test_groq(key)
     })
@@ -136,7 +136,7 @@ async def test_groq(key):
         resp = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
-            json={"model": "llama3-70b-8192", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
+            json={"model": "llama-3.1-70b-versatile", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
         )
         resp.raise_for_status()
 
@@ -166,9 +166,9 @@ async def test_gemini(key):
         )
         resp.raise_for_status()
 
-# ---------- Enhanced PROMPTS – including 25 new AGI/ASI accelerator topics ----------
+# ---------- PROMPTS (AI Development + Medical AI + 25 AGI/ASI) ----------
 PROMPTS = [
-    # ---- AI Development (15) ----
+    # AI Development (15)
     "Propose a novel architecture for AGI that combines neuro‑symbolic reasoning with constitutional constraints.",
     "Design a self‑improving AI training loop that uses cross‑model consensus to accelerate learning.",
     "How can LROS automatically ingest and implement breakthroughs from leading AI labs in real time?",
@@ -185,7 +185,7 @@ PROMPTS = [
     "Propose a way to combine LROS’s constitutional memory with vector databases for ultra‑fast retrieval.",
     "Design a self‑hosted version of LROS that can run offline on a laptop while sharing improvements via air‑gapped updates.",
 
-    # ---- Medical AI (20) ----
+    # Medical AI (20)
     "Propose an AI‑driven protocol for real‑time surgical assistance using wearable sensors and edge AI.",
     "Design a unified system connecting Safemed clinical pathways with patient wearables for predictive intervention.",
     "Create a mutation that optimizes the integration of exosome therapy protocols with robotic delivery systems.",
@@ -207,7 +207,7 @@ PROMPTS = [
     "How can LROS help design and simulate new medical robots using AI‑generated blueprints?",
     "Create a mutation that integrates genomic sequencing data with AI‑driven drug repurposing to find new uses for existing medications.",
 
-    # ---- NEW: AGI/ASI Accelerator Topics (25) ----
+    # AGI/ASI Accelerator (25)
     "Design a recursive self‑improvement protocol that allows LROS to autonomously rewrite parts of its own architecture while preserving constitutional alignment.",
     "Propose a method to combine brain‑computer interfaces with LROS to create a symbiotic human‑AI intelligence augmentation system.",
     "Develop a novel training paradigm that uses adversarial AI societies to generate and validate AGI‑level reasoning capabilities.",
@@ -298,10 +298,8 @@ async def generate_proposal(agent):
             raise
 
 # ---------- Rotational Ombudsman (multiple auditors) ----------
-# Define which models can act as auditors (they must be able to produce JSON scores)
 AUDITOR_MODELS = []
 for m in MODELS:
-    # For now, use Groq and DeepSeek (Mistral can be added if you adjust prompt)
     if m["name"] in ["groq", "deepseek"]:
         AUDITOR_MODELS.append(m)
 
@@ -315,7 +313,6 @@ async def _audit_with_model(auditor, proposal):
     if not key:
         raise ValueError(f"No healthy key for {auditor['name']}")
 
-    # Build audit prompt
     audit_prompt = f"{AUDIT_PROMPT}\n{proposal['content']}"
 
     # Format request for the specific model
@@ -333,14 +330,14 @@ async def _audit_with_model(auditor, proposal):
         url = auditor["endpoint"]
         headers = {"Authorization": f"Bearer {key}"}
         payload = {
-            "model": "deepseek-reasoner",   # Use reasoner for better scoring
+            "model": "deepseek-reasoner",
             "messages": [{"role": "user", "content": audit_prompt}],
             "temperature": 0.0,
             "max_tokens": 200,
             "response_format": {"type": "json_object"}
         }
     else:
-        # Fallback to generic OpenAI‑compatible
+        # Generic fallback (not used for auditors, but keep for completeness)
         url = auditor["endpoint"]
         headers = {"Authorization": f"Bearer {key}"}
         payload = {
@@ -371,7 +368,6 @@ def _fallback_audit(proposal):
     return {"score": score, "accepted": accepted, "reason": reason}
 
 async def audit_proposal(proposal):
-    # Try each auditor in order
     for auditor in AUDITOR_MODELS:
         try:
             audit = await _audit_with_model(auditor, proposal)
@@ -382,7 +378,6 @@ async def audit_proposal(proposal):
         except Exception as e:
             logger.error(f"Auditor {auditor['name']} failed: {e}")
             continue
-    # All failed or zero scores
     logger.warning("All auditors failed, using fallback audit")
     return _fallback_audit(proposal)
 
@@ -537,7 +532,6 @@ async def chat_endpoint(req: ChatRequest):
             groq = await call_model_direct("groq", deepseek)
             return {"response": groq, "mode_used": "chain"}
         elif mode == "auto":
-            # Simple routing: medical -> deepseek, else groq
             if any(k in prompt.lower() for k in ["medical", "exosome", "safemed", "clinical", "patient"]):
                 resp = await call_model_direct("deepseek", prompt)
                 return {"response": resp, "mode_used": "deepseek"}
