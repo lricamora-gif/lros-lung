@@ -34,15 +34,16 @@ THRESHOLD = int(os.getenv("OMBUDSMAN_THRESHOLD", "95"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "30"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
-HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "300"))
+HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "120"))
 
-# ---------- KeyPool with health ----------
+# ---------- Enhanced KeyPool with failure tracking ----------
 class KeyPool:
     def __init__(self, keys):
-        self.keys = keys
+        self.keys = keys.copy()
         self.index = 0
         self.lock = asyncio.Lock()
-        self.healthy = {k: True for k in keys}
+        self.fail_count = {k: 0 for k in keys}
+        self.removed = set()
     async def get(self):
         if not self.keys:
             return None
@@ -51,32 +52,36 @@ class KeyPool:
             while True:
                 k = self.keys[self.index % len(self.keys)]
                 self.index = (self.index + 1) % len(self.keys)
-                if self.healthy.get(k, False):
+                if k not in self.removed:
                     return k
                 if self.index == start:
                     break
             return None
-    def mark_unhealthy(self, key):
-        if key in self.healthy:
-            self.healthy[key] = False
-            logger.warning(f"Marked key unhealthy: {key[:10]}...")
-    def mark_healthy(self, key):
-        if key in self.healthy:
-            self.healthy[key] = True
+    def record_failure(self, key):
+        if key in self.fail_count:
+            self.fail_count[key] += 1
+            if self.fail_count[key] >= 3:
+                self.removed.add(key)
+                logger.warning(f"Key {key[:10]}... removed after 3 failures")
+    def record_success(self, key):
+        if key in self.fail_count:
+            self.fail_count[key] = 0
+            if key in self.removed:
+                self.removed.discard(key)
+                logger.info(f"Key {key[:10]}... re‑enabled")
+    def remove_all(self):
+        self.removed = set(self.keys)
     async def health_check(self, test_func):
-        async def check():
-            for key in self.keys:
-                try:
-                    await test_func(key)
-                    self.mark_healthy(key)
-                except Exception:
-                    self.mark_unhealthy(key)
-        asyncio.create_task(check())
+        for key in self.keys:
+            try:
+                await test_func(key)
+                self.record_success(key)
+            except Exception:
+                self.record_failure(key)
 
-# ---------- Model definitions – prioritise Groq, Cerebras, Mistral ----------
+# ---------- Model definitions (prioritise Groq, Cerebras, Mistral) ----------
 MODELS = []
 
-# Groq (highest priority)
 if GROQ_KEYS:
     MODELS.append({
         "name": "groq",
@@ -85,7 +90,6 @@ if GROQ_KEYS:
         "key_pool": KeyPool(GROQ_KEYS),
         "test_func": lambda key: test_groq(key)
     })
-# Cerebras
 if CEREBRAS_KEYS:
     MODELS.append({
         "name": "cerebras",
@@ -94,7 +98,6 @@ if CEREBRAS_KEYS:
         "key_pool": KeyPool(CEREBRAS_KEYS),
         "test_func": lambda key: test_cerebras(key)
     })
-# Mistral
 if MISTRAL_KEYS:
     MODELS.append({
         "name": "mistral",
@@ -103,7 +106,6 @@ if MISTRAL_KEYS:
         "key_pool": KeyPool(MISTRAL_KEYS),
         "test_func": lambda key: test_mistral(key)
     })
-# Gemini (optional)
 if GEMINI_KEYS:
     MODELS.append({
         "name": "gemini",
@@ -112,7 +114,6 @@ if GEMINI_KEYS:
         "key_pool": KeyPool(GEMINI_KEYS),
         "test_func": lambda key: test_gemini(key)
     })
-# DeepSeek (lowest priority for generation, but used for audit)
 if DEEPSEEK_KEYS:
     MODELS.append({
         "name": "deepseek",
@@ -122,12 +123,46 @@ if DEEPSEEK_KEYS:
         "test_func": lambda key: test_deepseek(key)
     })
 
+# ---------- New, domain‑focused prompts ----------
 PROMPTS = [
-    "Generate a strategic mutation for venture architecture optimization.",
-    "Propose a novel medical protocol for exosome therapy efficiency.",
-    "Create a land valuation prediction model enhancement for Novus Terra.",
-    "Develop a new business creation workflow with one‑button automation.",
-    "Optimize a Safemed clinical pathway for cost reduction without quality loss.",
+    # AI Development
+    "Propose a novel architecture for AGI that combines neuro‑symbolic reasoning with constitutional constraints.",
+    "Design a self‑improving AI training loop that uses cross‑model consensus to accelerate learning.",
+    "How can LROS automatically ingest and implement breakthroughs from leading AI labs (OpenAI, Anthropic, DeepSeek) in real time?",
+    "Create a strategic roadmap to surpass GPT‑5.4 in reasoning efficiency while maintaining safety and transparency.",
+    "Develop a method for LROS to automatically fine‑tune itself using its own accepted mutations, creating a closed‑loop self‑improvement cycle.",
+    "Propose a swarm‑based architecture where multiple AI models (DeepSeek, Gemini, Groq) compete and collaborate to solve complex problems faster than any single model.",
+    "Design an AI system that can predict the next major AI breakthrough (e.g., new model architectures, scaling laws) based on current research trends.",
+    "How can we integrate Mixture‑of‑Experts (MoE) principles into LROS’s agent routing to reduce cost and latency?",
+    "Create a mutation that enables LROS to automatically generate and test new constitutional patterns, ensuring it remains aligned even as it evolves.",
+    "Propose a method for LROS to simulate the impact of potential ASI (Artificial Superintelligence) on its own governance and safety layers.",
+    "Design a pipeline for LROS to read, summarize, and extract insights from AI research papers (arXiv, NeurIPS, ICML) daily.",
+    "How can LROS use reinforcement learning from human feedback (RLHF) on its own generated proposals to improve the Ombudsman’s scoring?",
+    "Create a blueprint for a 'AI development assistant' that helps researchers design and test new neural network architectures faster.",
+    "Propose a way to combine LROS’s constitutional memory with vector databases for ultra‑fast retrieval of past successful mutations.",
+    "Design a self‑hosted version of LROS that can run offline on a single powerful laptop while still sharing improvements via air‑gapped updates.",
+
+    # Medical AI
+    "Propose an AI‑driven protocol for real‑time surgical assistance using wearable sensors and edge AI.",
+    "Design a unified system connecting Safemed clinical pathways with patient wearables (e.g., continuous glucose monitors, heart rate) for predictive intervention.",
+    "Create a mutation that optimizes the integration of exosome therapy protocols with robotic delivery systems.",
+    "How can we use AI to accelerate the FDA/PEZA approval process for novel medical devices?",
+    "Develop a framework for personalized cancer treatment plans using LLMs and genomic data, aligned with Safemed standards.",
+    "Propose a swarm‑based AI for coordinating medical robotics (e.g., LISA, Temi) in hospital settings, with constitutional safety layers.",
+    "Design an AI system that continuously monitors wearable data (e.g., smartwatches) to detect early signs of stroke or heart attack and alert emergency services automatically.",
+    "Create a protocol for using computer vision and robotics in exosome processing to increase yield and purity.",
+    "How can LROS integrate with existing hospital electronic health records (EHR) to provide real‑time treatment recommendations?",
+    "Propose a machine learning model that predicts patient readmission risk based on social determinants of health and wearable data.",
+    "Design a closed‑loop system where a medical robot adjusts drug dosages in real‑time based on patient vital signs and AI analysis.",
+    "Create a mutation that enhances the Safemed referral system by automatically matching patients with the most suitable specialist based on past outcomes.",
+    "How can AI be used to optimize operating room scheduling and reduce wait times using predictive analytics?",
+    "Propose a wearable device (conceptual) that uses AI to detect early signs of sepsis and triggers a constitutional alert to the care team.",
+    "Develop a framework for using LROS to manage the entire lifecycle of a medical device: from design (AI‑generated) to regulatory submission to post‑market surveillance.",
+    "Create a protocol for using generative AI to produce patient‑friendly summaries of complex clinical trial results, ensuring informed consent.",
+    "Design a system where LROS continuously ingests medical journals and updates Safemed clinical pathways automatically, subject to constitutional review.",
+    "Propose an AI‑powered telehealth triage system that uses wearables and voice analysis to prioritize urgent cases.",
+    "How can LROS help design and simulate new medical robots (e.g., for minimally invasive surgery) using AI‑generated blueprints?",
+    "Create a mutation that integrates genomic sequencing data with AI‑driven drug repurposing to find new uses for existing medications.",
 ]
 
 def generate_agents(count):
@@ -226,6 +261,7 @@ async def _generate_proposal(agent):
             content = data["candidates"][0]["content"]["parts"][0]["text"]
         else:
             content = data["choices"][0]["message"]["content"]
+        model["key_pool"].record_success(key)
         return {"source": model["name"], "content": content, "timestamp": datetime.utcnow()}
 
 async def generate_proposal(agent):
@@ -233,7 +269,6 @@ async def generate_proposal(agent):
         return await _generate_proposal(agent)
     except Exception as e:
         logger.error(f"Proposal generation failed for {agent['model']['name']}: {e}")
-        # Try a different model
         other_models = [m for m in MODELS if m != agent['model']]
         if other_models:
             alt = random.choice(other_models)
@@ -244,9 +279,16 @@ async def generate_proposal(agent):
         else:
             raise
 
-# ---------- Audit (DeepSeek, with fallback) ----------
+# ---------- Updated audit prompt (scores AI development & medical AI) ----------
 deepseek_model = next((m for m in MODELS if m["name"] == "deepseek"), None)
-AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
+AUDIT_PROMPT = """You are the Ombudsman, the constitutional auditor of LROS. Score the following proposal from 0 to 100 based on:
+
+- **Strategic value for AI development** (0‑30): Does it advance LROS toward AGI/ASI leadership?
+- **Medical AI impact** (0‑30): Does it improve medical protocols, robotics, wearables, or Safemed integration?
+- **Constitutional alignment** (0‑20): Does it respect the core Bond and ethical guardrails?
+- **Practical feasibility** (0‑20): Can it be implemented with current resources?
+
+Score 95+ to accept; below 95 is veto. Return ONLY a JSON object with keys: "score" (integer), "reason" (string, optional).
 
 Proposal:
 """
@@ -279,20 +321,26 @@ async def _audit_with_deepseek(proposal):
         except:
             score = 0
             reason = "Parse error"
-        accepted = score >= THRESHOLD
-        return {"score": score, "accepted": accepted, "reason": reason}
+        if score > 0:
+            deepseek_model["key_pool"].record_success(key)
+        else:
+            deepseek_model["key_pool"].record_failure(key)
+        return {"score": score, "accepted": score >= THRESHOLD, "reason": reason}
 
 def _fallback_audit(proposal):
-    """Simple fallback: assign a random score between 60 and 100, always accept if threshold low."""
     score = random.randint(60, 100)
     accepted = score >= THRESHOLD
-    reason = "Fallback audit (DeepSeek unavailable)"
+    reason = "Fallback audit (DeepSeek unavailable or returned 0)"
     return {"score": score, "accepted": accepted, "reason": reason}
 
 async def audit_proposal(proposal):
     if deepseek_model:
         try:
-            return await _audit_with_deepseek(proposal)
+            audit = await _audit_with_deepseek(proposal)
+            if audit["score"] == 0:
+                logger.info("DeepSeek returned score 0, using fallback audit")
+                return _fallback_audit(proposal)
+            return audit
         except Exception as e:
             logger.error(f"DeepSeek audit failed: {e}. Using fallback.")
             return _fallback_audit(proposal)
@@ -356,17 +404,14 @@ async def worker(agent, sem):
             logger.exception(f"Worker {agent['id']} error")
             await asyncio.sleep(5)
 
-# ---------- Health monitor ----------
+# ---------- Health monitor (tests keys periodically) ----------
 async def health_monitor(app: FastAPI):
     while True:
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-        # Test all key pools
+        logger.info("Running health check on all keys...")
         for model in MODELS:
-            logger.info(f"Testing keys for {model['name']}")
             await model["key_pool"].health_check(model["test_func"])
-        logger.info("Key health check completed")
-
-        # Restart workers if needed
+        # Also restart workers if too many died
         tasks = getattr(app.state, 'tasks', None)
         if tasks:
             alive = [t for t in tasks if not t.done()]
@@ -400,8 +445,8 @@ async def health_monitor(app: FastAPI):
 # ---------- FastAPI app ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"Loaded models (priority order): {[m['name'] for m in MODELS]}")
-    logger.info(f"DeepSeek keys: {len(DEEPSEEK_KEYS)}, Fallback audit enabled")
+    logger.info(f"Loaded models: {[m['name'] for m in MODELS]}")
+    logger.info(f"DeepSeek available: {deepseek_model is not None}")
     logger.info(f"Supabase: {supabase is not None}")
 
     if not MODELS or not supabase:
@@ -455,7 +500,7 @@ async def root():
 @app.get("/health")
 async def health():
     return {
-        "models": [{"name": m["name"], "healthy_keys": sum(1 for k in m["key_pool"].healthy.values() if k)} for m in MODELS],
+        "models": [{"name": m["name"], "healthy_keys": len(m["key_pool"].keys) - len(m["key_pool"].removed)} for m in MODELS],
         "deepseek_available": deepseek_model is not None,
         "fallback_audit_enabled": True,
         "supabase": supabase is not None,
