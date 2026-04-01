@@ -5,18 +5,19 @@ import asyncio
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
+from typing import List, Optional
 
 import httpx
-from supabase import create_client
+from supabase import create_client, Client
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ---------- Configuration ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Lung")
 
-# Multi-key helpers
 def get_key_list(var_name):
     value = os.getenv(var_name, "")
     return [k.strip() for k in value.split(",") if k.strip()]
@@ -32,8 +33,9 @@ THRESHOLD = int(os.getenv("OMBUDSMAN_THRESHOLD", "95"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "50"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
+HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "60"))  # seconds
 
-# ---------- KeyPool class ----------
+# ---------- KeyPool with retry ----------
 class KeyPool:
     def __init__(self, keys):
         self.keys = keys
@@ -96,8 +98,10 @@ def generate_agents(count):
 
 AGENTS = generate_agents(AGENT_COUNT)
 
-# ---------- Proposal generation ----------
-async def generate_proposal(agent):
+# ---------- Proposal generation with retry ----------
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+       retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)))
+async def _generate_proposal(agent):
     key = await agent["model"]["key_pool"].get()
     if not key:
         raise ValueError(f"No API key for {agent['model']['name']}")
@@ -118,18 +122,30 @@ async def generate_proposal(agent):
         content = data["choices"][0]["message"]["content"]
         return {"source": agent["model"]["name"], "content": content, "timestamp": datetime.utcnow()}
 
-# ---------- Ombudsman (DeepSeek) ----------
-AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
+async def generate_proposal(agent):
+    try:
+        return await _generate_proposal(agent)
+    except Exception as e:
+        logger.error(f"Proposal generation failed for {agent['model']['name']}: {e}")
+        # Fallback: try a different model (rotate)
+        if len(MODELS) > 1:
+            alt_model = random.choice([m for m in MODELS if m != agent['model']])
+            logger.info(f"Switching to alternative model {alt_model['name']}")
+            agent = dict(agent)  # copy
+            agent["model"] = alt_model
+            return await _generate_proposal(agent)
+        else:
+            raise
 
-Proposal:
-"""
-
+# ---------- Ombudsman audit with retry ----------
 deepseek_pool = KeyPool(DEEPSEEK_KEYS)
 
-async def audit_proposal(proposal):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+       retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)))
+async def _audit_proposal(proposal):
     key = await deepseek_pool.get()
     if not key:
-        return {"score": 0, "accepted": False, "reason": "No DeepSeek keys"}
+        raise ValueError("No DeepSeek keys available")
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.deepseek.com/v1/chat/completions",
@@ -145,6 +161,7 @@ async def audit_proposal(proposal):
                 "response_format": {"type": "json_object"}
             }
         )
+        resp.raise_for_status()
         data = resp.json()
         try:
             result = json.loads(data["choices"][0]["message"]["content"])
@@ -156,8 +173,16 @@ async def audit_proposal(proposal):
         accepted = score >= THRESHOLD
         return {"score": score, "accepted": accepted, "reason": reason}
 
+async def audit_proposal(proposal):
+    try:
+        return await _audit_proposal(proposal)
+    except Exception as e:
+        logger.error(f"Audit failed: {e}")
+        # Return a conservative audit (veto) to avoid storing potentially bad mutations
+        return {"score": 0, "accepted": False, "reason": f"Audit error: {str(e)}"}
+
 # ---------- Supabase client ----------
-supabase = None
+supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -210,29 +235,76 @@ async def worker(agent, sem):
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.exception(f"Worker {agent['id']} error")
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)  # longer delay on persistent failure
+
+# ---------- Health monitor and worker supervisor ----------
+async def health_monitor(app: FastAPI):
+    while True:
+        await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+        # Check if workers are still running
+        if hasattr(app.state, 'tasks') and app.state.tasks:
+            alive = [t for t in app.state.tasks if not t.done()]
+            if len(alive) < WORKER_COUNT / 2:
+                logger.warning(f"Only {len(alive)} workers alive, restarting...")
+                # Cancel old tasks
+                for t in app.state.tasks:
+                    t.cancel()
+                await asyncio.sleep(2)
+                # Recreate workers
+                sem = asyncio.Semaphore(MAX_CONCURRENT)
+                new_tasks = []
+                for i in range(WORKER_COUNT):
+                    if i >= len(AGENTS):
+                        break
+                    agent = AGENTS[i % len(AGENTS)]
+                    new_tasks.append(asyncio.create_task(worker(agent, sem)))
+                app.state.tasks = new_tasks
+                logger.info(f"Restarted {len(new_tasks)} workers")
+        else:
+            # Workers never started or all died
+            if MODELS and deepseek_pool.keys and supabase:
+                logger.info("Workers not running, starting fresh...")
+                sem = asyncio.Semaphore(MAX_CONCURRENT)
+                tasks = []
+                for i in range(WORKER_COUNT):
+                    if i >= len(AGENTS):
+                        break
+                    agent = AGENTS[i % len(AGENTS)]
+                    tasks.append(asyncio.create_task(worker(agent, sem)))
+                app.state.tasks = tasks
+                logger.info(f"Started {len(tasks)} workers")
 
 # ---------- FastAPI app ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Debug: print counts
+    # Debug log
     logger.info(f"MODELS count: {len(MODELS)}, DeepSeek keys: {len(deepseek_pool.keys) if deepseek_pool else 0}, Supabase: {supabase is not None}")
     if not MODELS or not deepseek_pool.keys or not supabase:
-        logger.warning("Missing required services (models, DeepSeek keys, or Supabase). Workers not started.")
-        yield
-        return
-    logger.info(f"Lung starting: {WORKER_COUNT} workers, {AGENT_COUNT} agents")
-    sem = asyncio.Semaphore(MAX_CONCURRENT)
-    tasks = []
-    for i in range(WORKER_COUNT):
-        if i >= len(AGENTS):
-            break
-        agent = AGENTS[i % len(AGENTS)]
-        tasks.append(asyncio.create_task(worker(agent, sem)))
-    app.state.tasks = tasks
+        logger.warning("Missing required services. Workers will not start until all are available.")
+    else:
+        # Start initial workers
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        tasks = []
+        for i in range(WORKER_COUNT):
+            if i >= len(AGENTS):
+                break
+            agent = AGENTS[i % len(AGENTS)]
+            tasks.append(asyncio.create_task(worker(agent, sem)))
+        app.state.tasks = tasks
+        logger.info(f"Started {len(tasks)} workers")
+
+    # Start health monitor
+    monitor_task = asyncio.create_task(health_monitor(app))
+    app.state.monitor_task = monitor_task
+
     yield
-    for t in tasks:
-        t.cancel()
+
+    # Cleanup
+    if hasattr(app.state, 'tasks'):
+        for t in app.state.tasks:
+            t.cancel()
+    monitor_task.cancel()
+    await asyncio.gather(*(app.state.tasks + [monitor_task]), return_exceptions=True)
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
@@ -253,6 +325,25 @@ async def root():
         "workers": WORKER_COUNT,
         "agents": len(AGENTS),
         "status": "ok" if MODELS and deepseek_pool.keys and supabase else "missing_keys"
+    }
+
+@app.get("/health")
+async def health():
+    """Detailed health check for monitoring."""
+    return {
+        "models": {
+            "count": len(MODELS),
+            "names": [m["name"] for m in MODELS],
+            "keys_available": all(m["key_pool"].keys for m in MODELS)
+        },
+        "deepseek_keys": len(deepseek_pool.keys),
+        "supabase": supabase is not None,
+        "workers": {
+            "desired": WORKER_COUNT,
+            "active": len([t for t in getattr(app.state, 'tasks', []) if not t.done()]) if hasattr(app.state, 'tasks') else 0
+        },
+        "threshold": THRESHOLD,
+        "agent_count": len(AGENTS)
     }
 
 @app.get("/status")
@@ -284,3 +375,21 @@ async def secure_baseline(data: BaselineUpdate):
         raise HTTPException(status_code=503, detail="Supabase not configured")
     set_baseline(data.baseline)
     return {"status": "success", "baseline": data.baseline}
+
+@app.post("/reset_workers")
+async def reset_workers():
+    """Manually restart worker tasks (useful if workers hang)."""
+    if not hasattr(app.state, 'tasks'):
+        raise HTTPException(status_code=400, detail="No workers running")
+    for t in app.state.tasks:
+        t.cancel()
+    await asyncio.sleep(2)
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    tasks = []
+    for i in range(WORKER_COUNT):
+        if i >= len(AGENTS):
+            break
+        agent = AGENTS[i % len(AGENTS)]
+        tasks.append(asyncio.create_task(worker(agent, sem)))
+    app.state.tasks = tasks
+    return {"status": "restarted", "workers": len(tasks)}
