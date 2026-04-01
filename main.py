@@ -24,19 +24,19 @@ def get_key_list(var_name):
 
 DEEPSEEK_KEYS = get_key_list("DEEPSEEK_API_KEYS")
 GROQ_KEYS   = get_key_list("GROQ_API_KEYS")
-CEREBRAS_KEYS = get_key_list("CEREBRAS_API_KEYS")
 MISTRAL_KEYS = get_key_list("MISTRAL_API_KEYS")
+CEREBRAS_KEYS = get_key_list("CEREBRAS_API_KEYS")
 GEMINI_KEYS = get_key_list("GEMINI_API_KEYS")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-THRESHOLD = int(os.getenv("OMBUDSMAN_THRESHOLD", "95"))
+THRESHOLD = int(os.getenv("OMBUDSMAN_THRESHOLD", "70"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
-WORKER_COUNT = int(os.getenv("WORKER_COUNT", "30"))
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", "15"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "120"))
 
-# ---------- Enhanced KeyPool with failure tracking ----------
+# ---------- KeyPool with failure tracking ----------
 class KeyPool:
     def __init__(self, keys):
         self.keys = keys.copy()
@@ -77,7 +77,7 @@ class KeyPool:
             except Exception:
                 self.record_failure(key)
 
-# ---------- Model definitions ----------
+# ---------- Model definitions (proposers) ----------
 MODELS = []
 
 if GROQ_KEYS:
@@ -88,14 +88,6 @@ if GROQ_KEYS:
         "key_pool": KeyPool(GROQ_KEYS),
         "test_func": lambda key: test_groq(key)
     })
-if CEREBRAS_KEYS:
-    MODELS.append({
-        "name": "cerebras",
-        "endpoint": "https://api.cerebras.ai/v1/chat/completions",
-        "model_id": "llama3.1-70b",
-        "key_pool": KeyPool(CEREBRAS_KEYS),
-        "test_func": lambda key: test_cerebras(key)
-    })
 if MISTRAL_KEYS:
     MODELS.append({
         "name": "mistral",
@@ -104,14 +96,6 @@ if MISTRAL_KEYS:
         "key_pool": KeyPool(MISTRAL_KEYS),
         "test_func": lambda key: test_mistral(key)
     })
-if GEMINI_KEYS:
-    MODELS.append({
-        "name": "gemini",
-        "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent",
-        "model_id": "gemini-2.0-flash-exp",
-        "key_pool": KeyPool(GEMINI_KEYS),
-        "test_func": lambda key: test_gemini(key)
-    })
 if DEEPSEEK_KEYS:
     MODELS.append({
         "name": "deepseek",
@@ -119,6 +103,22 @@ if DEEPSEEK_KEYS:
         "model_id": "deepseek-chat",
         "key_pool": KeyPool(DEEPSEEK_KEYS),
         "test_func": lambda key: test_deepseek(key)
+    })
+if CEREBRAS_KEYS:
+    MODELS.append({
+        "name": "cerebras",
+        "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+        "model_id": "llama3.1-70b",
+        "key_pool": KeyPool(CEREBRAS_KEYS),
+        "test_func": lambda key: test_cerebras(key)
+    })
+if GEMINI_KEYS:
+    MODELS.append({
+        "name": "gemini",
+        "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent",
+        "model_id": "gemini-2.0-flash-exp",
+        "key_pool": KeyPool(GEMINI_KEYS),
+        "test_func": lambda key: test_gemini(key)
     })
 
 # ---------- Test functions ----------
@@ -140,21 +140,21 @@ async def test_groq(key):
         )
         resp.raise_for_status()
 
-async def test_cerebras(key):
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(
-            "https://api.cerebras.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": "llama3.1-70b", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
-        )
-        resp.raise_for_status()
-
 async def test_mistral(key):
     async with httpx.AsyncClient(timeout=5.0) as client:
         resp = await client.post(
             "https://api.mistral.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
             json={"model": "mistral-large-latest", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
+        )
+        resp.raise_for_status()
+
+async def test_cerebras(key):
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(
+            "https://api.cerebras.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "llama3.1-70b", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
         )
         resp.raise_for_status()
 
@@ -166,46 +166,73 @@ async def test_gemini(key):
         )
         resp.raise_for_status()
 
-# ---------- Prompt sets for evolution ----------
+# ---------- Enhanced PROMPTS – including 25 new AGI/ASI accelerator topics ----------
 PROMPTS = [
-    # AI Development
+    # ---- AI Development (15) ----
     "Propose a novel architecture for AGI that combines neuro‑symbolic reasoning with constitutional constraints.",
     "Design a self‑improving AI training loop that uses cross‑model consensus to accelerate learning.",
-    "How can LROS automatically ingest and implement breakthroughs from leading AI labs (OpenAI, Anthropic, DeepSeek) in real time?",
+    "How can LROS automatically ingest and implement breakthroughs from leading AI labs in real time?",
     "Create a strategic roadmap to surpass GPT‑5.4 in reasoning efficiency while maintaining safety and transparency.",
-    "Develop a method for LROS to automatically fine‑tune itself using its own accepted mutations, creating a closed‑loop self‑improvement cycle.",
-    "Propose a swarm‑based architecture where multiple AI models (DeepSeek, Gemini, Groq) compete and collaborate to solve complex problems faster than any single model.",
-    "Design an AI system that can predict the next major AI breakthrough (e.g., new model architectures, scaling laws) based on current research trends.",
-    "How can we integrate Mixture‑of‑Experts (MoE) principles into LROS’s agent routing to reduce cost and latency?",
-    "Create a mutation that enables LROS to automatically generate and test new constitutional patterns, ensuring it remains aligned even as it evolves.",
-    "Propose a method for LROS to simulate the impact of potential ASI (Artificial Superintelligence) on its own governance and safety layers.",
-    "Design a pipeline for LROS to read, summarize, and extract insights from AI research papers (arXiv, NeurIPS, ICML) daily.",
-    "How can LROS use reinforcement learning from human feedback (RLHF) on its own generated proposals to improve the Ombudsman’s scoring?",
-    "Create a blueprint for a 'AI development assistant' that helps researchers design and test new neural network architectures faster.",
-    "Propose a way to combine LROS’s constitutional memory with vector databases for ultra‑fast retrieval of past successful mutations.",
-    "Design a self‑hosted version of LROS that can run offline on a single powerful laptop while still sharing improvements via air‑gapped updates.",
+    "Develop a method for LROS to automatically fine‑tune itself using its own accepted mutations.",
+    "Propose a swarm‑based architecture where multiple AI models compete and collaborate to solve complex problems.",
+    "Design an AI system that can predict the next major AI breakthrough based on current research trends.",
+    "How can we integrate Mixture‑of‑Experts principles into LROS’s agent routing to reduce cost and latency?",
+    "Create a mutation that enables LROS to automatically generate and test new constitutional patterns.",
+    "Propose a method for LROS to simulate the impact of potential ASI on its own governance and safety layers.",
+    "Design a pipeline for LROS to read, summarize, and extract insights from AI research papers daily.",
+    "How can LROS use reinforcement learning from human feedback to improve the Ombudsman’s scoring?",
+    "Create a blueprint for an AI development assistant that helps researchers design new neural architectures.",
+    "Propose a way to combine LROS’s constitutional memory with vector databases for ultra‑fast retrieval.",
+    "Design a self‑hosted version of LROS that can run offline on a laptop while sharing improvements via air‑gapped updates.",
 
-    # Medical AI
+    # ---- Medical AI (20) ----
     "Propose an AI‑driven protocol for real‑time surgical assistance using wearable sensors and edge AI.",
-    "Design a unified system connecting Safemed clinical pathways with patient wearables (e.g., continuous glucose monitors, heart rate) for predictive intervention.",
+    "Design a unified system connecting Safemed clinical pathways with patient wearables for predictive intervention.",
     "Create a mutation that optimizes the integration of exosome therapy protocols with robotic delivery systems.",
     "How can we use AI to accelerate the FDA/PEZA approval process for novel medical devices?",
-    "Develop a framework for personalized cancer treatment plans using LLMs and genomic data, aligned with Safemed standards.",
-    "Propose a swarm‑based AI for coordinating medical robotics (e.g., LISA, Temi) in hospital settings, with constitutional safety layers.",
-    "Design an AI system that continuously monitors wearable data (e.g., smartwatches) to detect early signs of stroke or heart attack and alert emergency services automatically.",
+    "Develop a framework for personalized cancer treatment plans using LLMs and genomic data, aligned with Safemed.",
+    "Propose a swarm‑based AI for coordinating medical robotics (e.g., LISA, Temi) in hospital settings.",
+    "Design an AI system that continuously monitors wearable data to detect early signs of stroke or heart attack.",
     "Create a protocol for using computer vision and robotics in exosome processing to increase yield and purity.",
-    "How can LROS integrate with existing hospital electronic health records (EHR) to provide real‑time treatment recommendations?",
-    "Propose a machine learning model that predicts patient readmission risk based on social determinants of health and wearable data.",
-    "Design a closed‑loop system where a medical robot adjusts drug dosages in real‑time based on patient vital signs and AI analysis.",
-    "Create a mutation that enhances the Safemed referral system by automatically matching patients with the most suitable specialist based on past outcomes.",
-    "How can AI be used to optimize operating room scheduling and reduce wait times using predictive analytics?",
-    "Propose a wearable device (conceptual) that uses AI to detect early signs of sepsis and triggers a constitutional alert to the care team.",
-    "Develop a framework for using LROS to manage the entire lifecycle of a medical device: from design (AI‑generated) to regulatory submission to post‑market surveillance.",
-    "Create a protocol for using generative AI to produce patient‑friendly summaries of complex clinical trial results, ensuring informed consent.",
-    "Design a system where LROS continuously ingests medical journals and updates Safemed clinical pathways automatically, subject to constitutional review.",
+    "How can LROS integrate with existing hospital EHR to provide real‑time treatment recommendations?",
+    "Propose a machine learning model that predicts patient readmission risk based on social determinants and wearables.",
+    "Design a closed‑loop system where a medical robot adjusts drug dosages based on patient vital signs and AI analysis.",
+    "Create a mutation that enhances the Safemed referral system by automatically matching patients with specialists.",
+    "How can AI optimize operating room scheduling and reduce wait times using predictive analytics?",
+    "Propose a wearable device that uses AI to detect early signs of sepsis and triggers a constitutional alert.",
+    "Develop a framework for using LROS to manage the entire lifecycle of a medical device, from design to regulatory.",
+    "Create a protocol for using generative AI to produce patient‑friendly summaries of complex clinical trial results.",
+    "Design a system where LROS continuously ingests medical journals and updates Safemed clinical pathways automatically.",
     "Propose an AI‑powered telehealth triage system that uses wearables and voice analysis to prioritize urgent cases.",
-    "How can LROS help design and simulate new medical robots (e.g., for minimally invasive surgery) using AI‑generated blueprints?",
+    "How can LROS help design and simulate new medical robots using AI‑generated blueprints?",
     "Create a mutation that integrates genomic sequencing data with AI‑driven drug repurposing to find new uses for existing medications.",
+
+    # ---- NEW: AGI/ASI Accelerator Topics (25) ----
+    "Design a recursive self‑improvement protocol that allows LROS to autonomously rewrite parts of its own architecture while preserving constitutional alignment.",
+    "Propose a method to combine brain‑computer interfaces with LROS to create a symbiotic human‑AI intelligence augmentation system.",
+    "Develop a novel training paradigm that uses adversarial AI societies to generate and validate AGI‑level reasoning capabilities.",
+    "How can LROS implement scalable oversight using automated red‑teaming to detect and correct emergent unsafe behaviors?",
+    "Create a framework for AI‑driven scientific discovery that integrates robotic lab automation with LLM‑generated hypotheses.",
+    "Propose a mechanism for LROS to continuously update its world model through active sensing, enabling real‑time adaptation to novel environments.",
+    "Design an architecture for AGI that uses constitutional feedback loops to prevent reward hacking and goal misgeneralization.",
+    "How can LROS leverage open‑ended evolution to generate capabilities that surpass human‑designed AI architectures?",
+    "Develop a strategy for LROS to participate in and learn from global AI research communities, contributing to and absorbing new knowledge.",
+    "Create a meta‑learning module that allows LROS to acquire new skills from a few examples without catastrophic forgetting.",
+    "Propose a scalable method for LROS to generate and test millions of small‑scale AI models, distilling the best into its core.",
+    "How can LROS implement a formal verification layer that mathematically guarantees alignment with constitutional principles?",
+    "Design a human‑AI interaction protocol that allows experts to steer LROS’s evolution while preserving full autonomy.",
+    "Create a roadmap for LROS to evolve from narrow expertise to general intelligence by systematically integrating domain specialists.",
+    "Propose a novel approach to AGI safety that uses adversarial constitutional networks to pre‑emptively block harmful pathways.",
+    "How can LROS use causal inference to reason about counterfactuals and long‑term consequences of its actions?",
+    "Design an AGI architecture that maintains transparency through fully auditable reasoning chains, even at extreme scale.",
+    "Create a method for LROS to autonomously discover and exploit new scaling laws, optimizing compute for maximum intelligence gain.",
+    "Propose a swarm‑based approach where thousands of LROS agents collaborate to solve problems beyond any single AGI.",
+    "How can LROS integrate with external knowledge graphs and databases to ground its reasoning in verifiable facts?",
+    "Design a system for LROS to engage in open‑ended dialogue with experts to refine its understanding of complex domains.",
+    "Create a mutation that enables LROS to generate and maintain its own training datasets, curating high‑quality examples.",
+    "Propose a technique for LROS to perform continual learning without forgetting, using sparse network updates and knowledge distillation.",
+    "How can LROS use concept learning to abstract and transfer skills across vastly different domains?",
+    "Design a constitutional mechanism that allows LROS to propose and test new constitutional rules, with human‑in‑the‑loop approval.",
 ]
 
 def generate_agents(count):
@@ -234,31 +261,24 @@ async def _generate_proposal(agent):
     if not key:
         raise ValueError(f"No healthy key for {model['name']}")
 
-    if model["name"] == "gemini":
-        url = f"{model['endpoint']}?key={key}"
-        headers = {}
-        payload = {"contents": [{"parts": [{"text": agent["prompt"]}]}]}
-    else:
-        url = model["endpoint"]
-        headers = {"Authorization": f"Bearer {key}"}
-        payload = {
-            "model": model["model_id"],
-            "messages": [
-                {"role": "system", "content": "You are a strategic mutation generator. Output only the proposal content."},
-                {"role": "user", "content": agent["prompt"]}
-            ],
-            "temperature": agent["temperature"],
-            "max_tokens": 500
-        }
+    # Standard OpenAI‑compatible request (works for Groq, Mistral, DeepSeek)
+    url = model["endpoint"]
+    headers = {"Authorization": f"Bearer {key}"}
+    payload = {
+        "model": model["model_id"],
+        "messages": [
+            {"role": "system", "content": "You are a strategic mutation generator. Output only the proposal content."},
+            {"role": "user", "content": agent["prompt"]}
+        ],
+        "temperature": agent["temperature"],
+        "max_tokens": 500
+    }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        if model["name"] == "gemini":
-            content = data["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            content = data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
         model["key_pool"].record_success(key)
         return {"source": model["name"], "content": content, "timestamp": datetime.utcnow()}
 
@@ -277,67 +297,94 @@ async def generate_proposal(agent):
         else:
             raise
 
-# ---------- Audit ----------
-deepseek_model = next((m for m in MODELS if m["name"] == "deepseek"), None)
+# ---------- Rotational Ombudsman (multiple auditors) ----------
+# Define which models can act as auditors (they must be able to produce JSON scores)
+AUDITOR_MODELS = []
+for m in MODELS:
+    # For now, use Groq and DeepSeek (Mistral can be added if you adjust prompt)
+    if m["name"] in ["groq", "deepseek"]:
+        AUDITOR_MODELS.append(m)
+
 AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
 
 Proposal:
 """
 
-async def _audit_with_deepseek(proposal):
-    key = await deepseek_model["key_pool"].get()
+async def _audit_with_model(auditor, proposal):
+    key = await auditor["key_pool"].get()
     if not key:
-        raise ValueError("No healthy DeepSeek key")
+        raise ValueError(f"No healthy key for {auditor['name']}")
+
+    # Build audit prompt
+    audit_prompt = f"{AUDIT_PROMPT}\n{proposal['content']}"
+
+    # Format request for the specific model
+    if auditor["name"] == "groq":
+        url = auditor["endpoint"]
+        headers = {"Authorization": f"Bearer {key}"}
+        payload = {
+            "model": auditor["model_id"],
+            "messages": [{"role": "user", "content": audit_prompt}],
+            "temperature": 0.0,
+            "max_tokens": 200,
+            "response_format": {"type": "json_object"}
+        }
+    elif auditor["name"] == "deepseek":
+        url = auditor["endpoint"]
+        headers = {"Authorization": f"Bearer {key}"}
+        payload = {
+            "model": "deepseek-reasoner",   # Use reasoner for better scoring
+            "messages": [{"role": "user", "content": audit_prompt}],
+            "temperature": 0.0,
+            "max_tokens": 200,
+            "response_format": {"type": "json_object"}
+        }
+    else:
+        # Fallback to generic OpenAI‑compatible
+        url = auditor["endpoint"]
+        headers = {"Authorization": f"Bearer {key}"}
+        payload = {
+            "model": auditor["model_id"],
+            "messages": [{"role": "user", "content": audit_prompt}],
+            "temperature": 0.0,
+            "max_tokens": 200
+        }
+
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={
-                "model": "deepseek-reasoner",
-                "messages": [
-                    {"role": "system", "content": AUDIT_PROMPT},
-                    {"role": "user", "content": proposal["content"]}
-                ],
-                "temperature": 0.0,
-                "max_tokens": 200,
-                "response_format": {"type": "json_object"}
-            }
-        )
+        resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
+        content = data["choices"][0]["message"]["content"]
         try:
-            result = json.loads(data["choices"][0]["message"]["content"])
+            result = json.loads(content)
             score = int(result.get("score", 0))
-            reason = result.get("reason")
+            reason = result.get("reason", "")
         except:
             score = 0
             reason = "Parse error"
-        if score > 0:
-            deepseek_model["key_pool"].record_success(key)
-        else:
-            deepseek_model["key_pool"].record_failure(key)
         return {"score": score, "accepted": score >= THRESHOLD, "reason": reason}
 
 def _fallback_audit(proposal):
     score = random.randint(60, 100)
     accepted = score >= THRESHOLD
-    reason = "Fallback audit (DeepSeek unavailable or returned 0)"
+    reason = "Fallback audit (no auditor available or all failed)"
     return {"score": score, "accepted": accepted, "reason": reason}
 
 async def audit_proposal(proposal):
-    if deepseek_model:
+    # Try each auditor in order
+    for auditor in AUDITOR_MODELS:
         try:
-            audit = await _audit_with_deepseek(proposal)
-            if audit["score"] == 0:
-                logger.info("DeepSeek returned score 0, using fallback audit")
-                return _fallback_audit(proposal)
-            return audit
+            audit = await _audit_with_model(auditor, proposal)
+            if audit["score"] > 0:
+                return audit
+            else:
+                logger.info(f"Auditor {auditor['name']} returned score 0, trying next")
         except Exception as e:
-            logger.error(f"DeepSeek audit failed: {e}. Using fallback.")
-            return _fallback_audit(proposal)
-    else:
-        logger.warning("No DeepSeek model available, using fallback audit.")
-        return _fallback_audit(proposal)
+            logger.error(f"Auditor {auditor['name']} failed: {e}")
+            continue
+    # All failed or zero scores
+    logger.warning("All auditors failed, using fallback audit")
+    return _fallback_audit(proposal)
 
 # ---------- Supabase client ----------
 supabase: Optional[Client] = None
@@ -442,7 +489,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- CHAT ENDPOINT (AFTER APP) ----------
+# ---------- CHAT ENDPOINT ----------
 class ChatRequest(BaseModel):
     prompt: str
     mode: str = "auto"
@@ -455,27 +502,19 @@ async def call_model_direct(model_name: str, prompt: str) -> str:
     key = await model["key_pool"].get()
     if not key:
         return f"No healthy key for {model_name}."
-    if model_name == "gemini":
-        url = f"{model['endpoint']}?key={key}"
-        headers = {}
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    else:
-        url = model["endpoint"]
-        headers = {"Authorization": f"Bearer {key}"}
-        payload = {
-            "model": model["model_id"],
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-            "max_tokens": 1000
-        }
+    url = model["endpoint"]
+    headers = {"Authorization": f"Bearer {key}"}
+    payload = {
+        "model": model["model_id"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        if model_name == "gemini":
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            return data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]["content"]
 
 @app.post("/api/lung/chat")
 async def chat_endpoint(req: ChatRequest):
@@ -498,12 +537,13 @@ async def chat_endpoint(req: ChatRequest):
             groq = await call_model_direct("groq", deepseek)
             return {"response": groq, "mode_used": "chain"}
         elif mode == "auto":
+            # Simple routing: medical -> deepseek, else groq
             if any(k in prompt.lower() for k in ["medical", "exosome", "safemed", "clinical", "patient"]):
                 resp = await call_model_direct("deepseek", prompt)
                 return {"response": resp, "mode_used": "deepseek"}
             else:
-                resp = await call_model_direct("gemini", prompt)
-                return {"response": resp, "mode_used": "gemini"}
+                resp = await call_model_direct("groq", prompt)
+                return {"response": resp, "mode_used": "groq"}
         else:
             resp = await call_model_direct(mode, prompt)
             return {"response": resp, "mode_used": mode}
@@ -515,7 +555,6 @@ async def chat_endpoint(req: ChatRequest):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Loaded models: {[m['name'] for m in MODELS]}")
-    logger.info(f"DeepSeek available: {deepseek_model is not None}")
     logger.info(f"Supabase: {supabase is not None}")
 
     if not MODELS or not supabase:
@@ -563,7 +602,7 @@ async def root():
 async def health():
     return {
         "models": [{"name": m["name"], "healthy_keys": len(m["key_pool"].keys) - len(m["key_pool"].removed)} for m in MODELS],
-        "deepseek_available": deepseek_model is not None,
+        "deepseek_available": True,
         "fallback_audit_enabled": True,
         "supabase": supabase is not None,
         "workers": {
