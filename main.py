@@ -69,8 +69,6 @@ class KeyPool:
             if key in self.removed:
                 self.removed.discard(key)
                 logger.info(f"Key {key[:10]}... re‑enabled")
-    def remove_all(self):
-        self.removed = set(self.keys)
     async def health_check(self, test_func):
         for key in self.keys:
             try:
@@ -79,7 +77,7 @@ class KeyPool:
             except Exception:
                 self.record_failure(key)
 
-# ---------- Model definitions (prioritise Groq, Cerebras, Mistral) ----------
+# ---------- Model definitions (for both evolution and chat) ----------
 MODELS = []
 
 if GROQ_KEYS:
@@ -123,7 +121,52 @@ if DEEPSEEK_KEYS:
         "test_func": lambda key: test_deepseek(key)
     })
 
-# ---------- New, domain‑focused prompts ----------
+# ---------- Test functions ----------
+async def test_deepseek(key):
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
+        )
+        resp.raise_for_status()
+
+async def test_groq(key):
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "llama3-70b-8192", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
+        )
+        resp.raise_for_status()
+
+async def test_cerebras(key):
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(
+            "https://api.cerebras.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "llama3.1-70b", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
+        )
+        resp.raise_for_status()
+
+async def test_mistral(key):
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "mistral-large-latest", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
+        )
+        resp.raise_for_status()
+
+async def test_gemini(key):
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={key}",
+            json={"contents": [{"parts": [{"text": "test"}]}]}
+        )
+        resp.raise_for_status()
+
+# ---------- Prompt sets for evolution (kept) ----------
 PROMPTS = [
     # AI Development
     "Propose a novel architecture for AGI that combines neuro‑symbolic reasoning with constitutional constraints.",
@@ -182,52 +225,7 @@ def generate_agents(count):
 
 AGENTS = generate_agents(AGENT_COUNT)
 
-# ---------- Test functions ----------
-async def test_deepseek(key):
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
-        )
-        resp.raise_for_status()
-
-async def test_groq(key):
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": "llama3-70b-8192", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
-        )
-        resp.raise_for_status()
-
-async def test_cerebras(key):
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(
-            "https://api.cerebras.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": "llama3.1-70b", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
-        )
-        resp.raise_for_status()
-
-async def test_mistral(key):
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(
-            "https://api.mistral.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": "mistral-large-latest", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
-        )
-        resp.raise_for_status()
-
-async def test_gemini(key):
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={key}",
-            json={"contents": [{"parts": [{"text": "test"}]}]}
-        )
-        resp.raise_for_status()
-
-# ---------- Proposal generation ----------
+# ---------- Proposal generation (evolution) ----------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)))
 async def _generate_proposal(agent):
@@ -279,16 +277,9 @@ async def generate_proposal(agent):
         else:
             raise
 
-# ---------- Updated audit prompt (scores AI development & medical AI) ----------
+# ---------- Audit (DeepSeek, with fallback for score 0) ----------
 deepseek_model = next((m for m in MODELS if m["name"] == "deepseek"), None)
-AUDIT_PROMPT = """You are the Ombudsman, the constitutional auditor of LROS. Score the following proposal from 0 to 100 based on:
-
-- **Strategic value for AI development** (0‑30): Does it advance LROS toward AGI/ASI leadership?
-- **Medical AI impact** (0‑30): Does it improve medical protocols, robotics, wearables, or Safemed integration?
-- **Constitutional alignment** (0‑20): Does it respect the core Bond and ethical guardrails?
-- **Practical feasibility** (0‑20): Can it be implemented with current resources?
-
-Score 95+ to accept; below 95 is veto. Return ONLY a JSON object with keys: "score" (integer), "reason" (string, optional).
+AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
 
 Proposal:
 """
@@ -391,7 +382,7 @@ def set_baseline(value):
     supabase.table("baseline").upsert({"id": 1, "value": value}).execute()
     return True
 
-# ---------- Background worker ----------
+# ---------- Background worker (evolution) ----------
 async def worker(agent, sem):
     while True:
         try:
@@ -404,14 +395,13 @@ async def worker(agent, sem):
             logger.exception(f"Worker {agent['id']} error")
             await asyncio.sleep(5)
 
-# ---------- Health monitor (tests keys periodically) ----------
+# ---------- Health monitor ----------
 async def health_monitor(app: FastAPI):
     while True:
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
         logger.info("Running health check on all keys...")
         for model in MODELS:
             await model["key_pool"].health_check(model["test_func"])
-        # Also restart workers if too many died
         tasks = getattr(app.state, 'tasks', None)
         if tasks:
             alive = [t for t in tasks if not t.done()]
@@ -441,6 +431,80 @@ async def health_monitor(app: FastAPI):
                     tasks.append(asyncio.create_task(worker(agent, sem)))
                 app.state.tasks = tasks
                 logger.info(f"Started {len(tasks)} workers")
+
+# ---------- CHAT ENDPOINT (NEW) ----------
+class ChatRequest(BaseModel):
+    prompt: str
+    mode: str = "auto"   # auto, parallel, chain, or specific model name
+
+async def call_model_direct(model_name: str, prompt: str) -> str:
+    """Call a specific model directly for chat."""
+    model = next((m for m in MODELS if m["name"] == model_name), None)
+    if not model:
+        return f"Model {model_name} not available."
+    key = await model["key_pool"].get()
+    if not key:
+        return f"No healthy key for {model_name}."
+    if model_name == "gemini":
+        url = f"{model['endpoint']}?key={key}"
+        headers = {}
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    else:
+        url = model["endpoint"]
+        headers = {"Authorization": f"Bearer {key}"}
+        payload = {
+            "model": model["model_id"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 1000
+        }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        if model_name == "gemini":
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            return data["choices"][0]["message"]["content"]
+
+@app.post("/api/lung/chat")
+async def chat_endpoint(req: ChatRequest):
+    """Unified chat endpoint supporting all modes."""
+    mode = req.mode.lower()
+    prompt = req.prompt
+    try:
+        if mode == "parallel":
+            # Call all models in parallel
+            tasks = [call_model_direct(m["name"], prompt) for m in MODELS]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            outputs = []
+            for i, res in enumerate(results):
+                if isinstance(res, Exception):
+                    outputs.append(f"{MODELS[i]['name']}: Error - {str(res)}")
+                else:
+                    outputs.append(f"{MODELS[i]['name']}: {res}")
+            response = "\n\n---\n\n".join(outputs)
+            return {"response": response, "mode_used": "parallel"}
+        elif mode == "chain":
+            # DeepSeek first, then Groq
+            deepseek = await call_model_direct("deepseek", prompt)
+            groq = await call_model_direct("groq", deepseek)
+            return {"response": groq, "mode_used": "chain"}
+        elif mode == "auto":
+            # Use a simple routing: if medical keywords, use deepseek; else gemini
+            if any(k in prompt.lower() for k in ["medical", "exosome", "safemed", "clinical", "patient"]):
+                resp = await call_model_direct("deepseek", prompt)
+                return {"response": resp, "mode_used": "deepseek"}
+            else:
+                resp = await call_model_direct("gemini", prompt)
+                return {"response": resp, "mode_used": "gemini"}
+        else:
+            # Specific model
+            resp = await call_model_direct(mode, prompt)
+            return {"response": resp, "mode_used": mode}
+    except Exception as e:
+        logger.exception("Chat error")
+        return {"response": f"Error: {str(e)}", "mode_used": mode}
 
 # ---------- FastAPI app ----------
 @asynccontextmanager
