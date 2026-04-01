@@ -186,13 +186,10 @@ def store_mutation(proposal, audit):
 def get_baseline():
     if not supabase:
         return 439434
-    # Ensure baseline table exists (we'll use a single row with id=1)
-    # Create table if not exists – but we'll rely on SQL to be run manually once.
     res = supabase.table("baseline").select("value").eq("id", 1).execute()
     if res.data:
         return res.data[0]["value"]
     else:
-        # Insert default
         supabase.table("baseline").insert({"id": 1, "value": 439434}).execute()
         return 439434
 
@@ -218,7 +215,8 @@ async def worker(agent, sem):
 # ---------- FastAPI app ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start workers only if all required pieces are present
+    # Debug: print counts
+    logger.info(f"MODELS count: {len(MODELS)}, DeepSeek keys: {len(deepseek_pool.keys) if deepseek_pool else 0}, Supabase: {supabase is not None}")
     if not MODELS or not deepseek_pool.keys or not supabase:
         logger.warning("Missing required services (models, DeepSeek keys, or Supabase). Workers not started.")
         yield
