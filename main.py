@@ -8,22 +8,20 @@ from contextlib import asynccontextmanager
 
 import httpx
 from supabase import create_client
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # ---------- Configuration ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Lung")
 
-# --- Multi‑key helpers ---
+# Multi-key helpers
 def get_key_list(var_name):
     value = os.getenv(var_name, "")
     return [k.strip() for k in value.split(",") if k.strip()]
 
-# DeepSeek keys
 DEEPSEEK_KEYS = get_key_list("DEEPSEEK_API_KEYS")
-
-# Model keys (each can be a comma‑separated list)
 GROQ_KEYS   = get_key_list("GROQ_API_KEY")
 CEREBRAS_KEYS = get_key_list("CEREBRAS_API_KEY")
 MISTRAL_KEYS = get_key_list("MISTRAL_API_KEY")
@@ -35,7 +33,7 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_AUDITS", "10"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "50"))
 AGENT_COUNT = int(os.getenv("AGENT_COUNT", "500"))
 
-# --- Model definitions (with key pools) ---
+# ---------- KeyPool class ----------
 class KeyPool:
     def __init__(self, keys):
         self.keys = keys
@@ -49,7 +47,7 @@ class KeyPool:
             self.index += 1
             return k
 
-# Build model list only if keys exist
+# ---------- Model definitions ----------
 MODELS = []
 if GROQ_KEYS:
     MODELS.append({
@@ -120,7 +118,7 @@ async def generate_proposal(agent):
         content = data["choices"][0]["message"]["content"]
         return {"source": agent["model"]["name"], "content": content, "timestamp": datetime.utcnow()}
 
-# ---------- Ombudsman (DeepSeek) with key pool ----------
+# ---------- Ombudsman (DeepSeek) ----------
 AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
 
 Proposal:
@@ -158,7 +156,7 @@ async def audit_proposal(proposal):
         accepted = score >= THRESHOLD
         return {"score": score, "accepted": accepted, "reason": reason}
 
-# ---------- Supabase storage ----------
+# ---------- Supabase client ----------
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -183,6 +181,26 @@ def store_mutation(proposal, audit):
             "timestamp": datetime.utcnow().isoformat()
         }).execute()
         logger.info(f"Vetoed {proposal['source']} (score {audit['score']})")
+
+# ---------- Baseline management ----------
+def get_baseline():
+    if not supabase:
+        return 439434
+    # Ensure baseline table exists (we'll use a single row with id=1)
+    # Create table if not exists – but we'll rely on SQL to be run manually once.
+    res = supabase.table("baseline").select("value").eq("id", 1).execute()
+    if res.data:
+        return res.data[0]["value"]
+    else:
+        # Insert default
+        supabase.table("baseline").insert({"id": 1, "value": 439434}).execute()
+        return 439434
+
+def set_baseline(value):
+    if not supabase:
+        return False
+    supabase.table("baseline").upsert({"id": 1, "value": value}).execute()
+    return True
 
 # ---------- Background worker ----------
 async def worker(agent, sem):
@@ -227,6 +245,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class BaselineUpdate(BaseModel):
+    baseline: int
+
 @app.get("/")
 async def root():
     return {
@@ -245,6 +266,7 @@ async def status():
         recent_vetoes = supabase.table("vetoes").select("*").order("timestamp", desc=True).limit(5).execute()
         mutation_count = supabase.table("mutations").select("*", count="exact").execute().count
         veto_count = supabase.table("vetoes").select("*", count="exact").execute().count
+        baseline = get_baseline()
     except Exception as e:
         return {"error": str(e)}
     return {
@@ -253,6 +275,14 @@ async def status():
         "threshold": THRESHOLD,
         "mutations_total": mutation_count,
         "vetoes_total": veto_count,
+        "baseline": baseline,
         "recent_mutations": recent_mutations.data,
         "recent_vetoes": recent_vetoes.data,
     }
+
+@app.post("/secure_baseline")
+async def secure_baseline(data: BaselineUpdate):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    set_baseline(data.baseline)
+    return {"status": "success", "baseline": data.baseline}
