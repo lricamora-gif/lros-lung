@@ -77,7 +77,7 @@ class KeyPool:
             except Exception:
                 self.record_failure(key)
 
-# ---------- Model definitions (for both evolution and chat) ----------
+# ---------- Model definitions ----------
 MODELS = []
 
 if GROQ_KEYS:
@@ -166,7 +166,7 @@ async def test_gemini(key):
         )
         resp.raise_for_status()
 
-# ---------- Prompt sets for evolution (kept) ----------
+# ---------- Prompt sets for evolution ----------
 PROMPTS = [
     # AI Development
     "Propose a novel architecture for AGI that combines neuro‑symbolic reasoning with constitutional constraints.",
@@ -225,7 +225,7 @@ def generate_agents(count):
 
 AGENTS = generate_agents(AGENT_COUNT)
 
-# ---------- Proposal generation (evolution) ----------
+# ---------- Proposal generation ----------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)))
 async def _generate_proposal(agent):
@@ -277,7 +277,7 @@ async def generate_proposal(agent):
         else:
             raise
 
-# ---------- Audit (DeepSeek, with fallback for score 0) ----------
+# ---------- Audit ----------
 deepseek_model = next((m for m in MODELS if m["name"] == "deepseek"), None)
 AUDIT_PROMPT = """You are the Ombudsman. Score the following proposal 0‑100. Score 95+ to accept. Return JSON: {"score": int, "reason": str}.
 
@@ -382,7 +382,7 @@ def set_baseline(value):
     supabase.table("baseline").upsert({"id": 1, "value": value}).execute()
     return True
 
-# ---------- Background worker (evolution) ----------
+# ---------- Background worker ----------
 async def worker(agent, sem):
     while True:
         try:
@@ -432,10 +432,20 @@ async def health_monitor(app: FastAPI):
                 app.state.tasks = tasks
                 logger.info(f"Started {len(tasks)} workers")
 
-# ---------- CHAT ENDPOINT (NEW) ----------
+# ---------- FastAPI app ----------
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- CHAT ENDPOINT (AFTER APP) ----------
 class ChatRequest(BaseModel):
     prompt: str
-    mode: str = "auto"   # auto, parallel, chain, or specific model name
+    mode: str = "auto"
 
 async def call_model_direct(model_name: str, prompt: str) -> str:
     """Call a specific model directly for chat."""
@@ -469,12 +479,10 @@ async def call_model_direct(model_name: str, prompt: str) -> str:
 
 @app.post("/api/lung/chat")
 async def chat_endpoint(req: ChatRequest):
-    """Unified chat endpoint supporting all modes."""
     mode = req.mode.lower()
     prompt = req.prompt
     try:
         if mode == "parallel":
-            # Call all models in parallel
             tasks = [call_model_direct(m["name"], prompt) for m in MODELS]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             outputs = []
@@ -486,12 +494,10 @@ async def chat_endpoint(req: ChatRequest):
             response = "\n\n---\n\n".join(outputs)
             return {"response": response, "mode_used": "parallel"}
         elif mode == "chain":
-            # DeepSeek first, then Groq
             deepseek = await call_model_direct("deepseek", prompt)
             groq = await call_model_direct("groq", deepseek)
             return {"response": groq, "mode_used": "chain"}
         elif mode == "auto":
-            # Use a simple routing: if medical keywords, use deepseek; else gemini
             if any(k in prompt.lower() for k in ["medical", "exosome", "safemed", "clinical", "patient"]):
                 resp = await call_model_direct("deepseek", prompt)
                 return {"response": resp, "mode_used": "deepseek"}
@@ -499,14 +505,13 @@ async def chat_endpoint(req: ChatRequest):
                 resp = await call_model_direct("gemini", prompt)
                 return {"response": resp, "mode_used": "gemini"}
         else:
-            # Specific model
             resp = await call_model_direct(mode, prompt)
             return {"response": resp, "mode_used": mode}
     except Exception as e:
         logger.exception("Chat error")
         return {"response": f"Error: {str(e)}", "mode_used": mode}
 
-# ---------- FastAPI app ----------
+# ---------- Lifespan and other routes ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Loaded models: {[m['name'] for m in MODELS]}")
@@ -540,14 +545,7 @@ async def lifespan(app: FastAPI):
                          app.state.monitor_task if hasattr(app.state, 'monitor_task') else asyncio.sleep(0),
                          return_exceptions=True)
 
-app = FastAPI(lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.router.lifespan_context = lifespan
 
 class BaselineUpdate(BaseModel):
     baseline: int
