@@ -178,7 +178,7 @@ async def test_gemini(key):
         )
         resp.raise_for_status()
 
-# ---------- Prompt sets (unchanged) ----------
+# ---------- Prompt sets (unchanged – includes AI, Medical, AGI/ASI) ----------
 PROMPTS = [
     # AI Development (15)
     "Propose a novel architecture for AGI that combines neuro‑symbolic reasoning with constitutional constraints.",
@@ -548,7 +548,7 @@ async def worker(agent, sem):
             proposal = await generate_proposal(agent)
             async with sem:
                 audit = await audit_proposal(proposal)
-            await store_mutation(proposal, audit)   # now await
+            await store_mutation(proposal, audit)
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.exception(f"Worker {agent['id']} error")
@@ -653,8 +653,13 @@ async def chat_endpoint(req: ChatRequest):
                 resp = await call_model_direct("deepseek", prompt)
                 return {"response": resp, "mode_used": "deepseek"}
             else:
-                resp = await call_model_direct("groq", prompt)
-                return {"response": resp, "mode_used": "groq"}
+                # Try Gemini first, fallback to DeepSeek if needed
+                try:
+                    resp = await call_model_direct("gemini", prompt)
+                    return {"response": resp, "mode_used": "gemini"}
+                except Exception:
+                    resp = await call_model_direct("deepseek", prompt)
+                    return {"response": resp, "mode_used": "deepseek (fallback)"}
         else:
             resp = await call_model_direct(mode, prompt)
             return {"response": resp, "mode_used": mode}
@@ -770,3 +775,9 @@ async def reset_workers():
         tasks.append(asyncio.create_task(worker(agent, sem)))
     app.state.tasks = tasks
     return {"status": "restarted", "workers": len(tasks)}
+
+# ---------- Web server entry point ----------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
