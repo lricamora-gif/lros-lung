@@ -1,6 +1,5 @@
 # ============================================================================
-# LROS – Domain‑Focused AI Evolution Engine
-# Targets: AGI/ASI, Medical ASI, Novus Terra Services/Products
+# LROS – Complete Integrated Backend (Heart + Lung + Governance + Ingestion)
 # ============================================================================
 
 import os
@@ -12,7 +11,6 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from typing import Optional
-import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Integrated")
@@ -26,46 +24,6 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise Exception("Missing SUPABASE_URL or SUPABASE_KEY")
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ---------- API Keys ----------
-DEEPSEEK_API_KEYS = [k.strip() for k in os.environ.get("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
-GEMINI_API_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEYS", "").split(",") if k.strip()]
-
-deepseek_index = 0
-gemini_index = 0
-
-def call_ai(prompt: str, temperature: float = 0.7) -> str:
-    global deepseek_index, gemini_index
-    if DEEPSEEK_API_KEYS:
-        for _ in range(len(DEEPSEEK_API_KEYS)):
-            key = DEEPSEEK_API_KEYS[deepseek_index % len(DEEPSEEK_API_KEYS)]
-            deepseek_index += 1
-            try:
-                headers = {"Authorization": f"Bearer {key}"}
-                payload = {
-                    "model": "deepseek-chat",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": temperature
-                }
-                response = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
-                return response.json()["choices"][0]["message"]["content"]
-            except Exception as e:
-                logger.warning(f"DeepSeek key {key[:5]}... failed: {e}")
-                continue
-    if GEMINI_API_KEYS:
-        import google.generativeai as genai
-        for _ in range(len(GEMINI_API_KEYS)):
-            key = GEMINI_API_KEYS[gemini_index % len(GEMINI_API_KEYS)]
-            gemini_index += 1
-            try:
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel("gemini-1.5-flash")
-                response = model.generate_content(prompt, generation_config={"temperature": temperature})
-                return response.text
-            except Exception as e:
-                logger.warning(f"Gemini key {key[:5]}... failed: {e}")
-                continue
-    return "[Simulated] No AI key available."
 
 # ---------- Ensure Tables ----------
 def ensure_tables():
@@ -100,6 +58,7 @@ def get_state():
 def save_state(state):
     db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
 
+# ---------- Helper: Insert Mutation ----------
 def insert_mutation(content, score, source, domain, agent, veto_reason=None):
     try:
         db.table("mutations").insert({
@@ -125,7 +84,7 @@ def insert_layer_proposal(name, description):
     except Exception as e:
         logger.error(f"Insert layer proposal failed: {e}")
 
-# ---------- Heart Worker (unchanged) ----------
+# ---------- Heart Worker ----------
 async def heart_worker():
     while True:
         try:
@@ -155,79 +114,35 @@ async def heart_worker():
             logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Lung Worker – Domain‑Focused AI Evolution ----------
+# ---------- Lung Worker (simplified, no AI keys required) ----------
 async def lung_worker():
-    threshold = int(os.environ.get("OMBUDSMAN_THRESHOLD", "85"))
-    auto_lab = os.environ.get("AUTO_LAB", "false").lower() == "true"
-    # Focus domains – you can add more
-    domains = [
-        "AI evolution & AGI architecture",
-        "Medical ASI (diagnostic, therapeutic, personalised medicine)",
-        "Novus Terra proprietary services (asset tokenisation, sovereign AI, healthcare JVs)"
-    ]
-    model_names = ["deepseek", "gemini", "cerebras", "groq", "mistral"]
+    threshold = 85
+    models = ["deepseek", "mistral", "groq", "gemini", "cerebras"]
+    domains = ["Medical Innovation", "Longevity Science", "Regulatory Compliance", "Venture Architecture"]
     while True:
         try:
             state = get_state()
+            model = random.choice(models)
+            oScore = random.randint(50, 100)
             domain = random.choice(domains)
-            model_used = random.choice(model_names)
-
-            # 1. Generate mutation strategy
-            generate_prompt = f"""You are LROS, a constitutional AI operating system. Propose a novel, actionable, high‑value strategy in the domain: {domain}. 
-Focus on creating a new proprietary service, product, or evolutionary step that could become part of Novus Terra’s offerings or advance AGI/ASI. 
-Keep it concise (150–250 words). Be specific – include metrics or concrete steps."""
-            mutation_content = call_ai(generate_prompt, temperature=0.8)
-            if mutation_content.startswith("[Simulated]"):
-                mutation_content = f"New strategy for {domain}: integrate federated learning across healthcare JVs to reduce data silos, projected 30% efficiency gain."
-
-            # 2. Ombudsman scoring
-            score_prompt = f"""Rate the following strategy from 0 to 100, where 100 is brilliant, game‑changing, and 0 is useless or harmful. Return only the integer score.
-
-Strategy: {mutation_content}
-
-Score:"""
-            score_response = call_ai(score_prompt, temperature=0.2)
-            try:
-                oScore = int(score_response.strip())
-                oScore = max(0, min(100, oScore))
-            except:
-                oScore = random.randint(50, 100)
-
-            # 3. Auto‑Lab simulation (placeholder – replace with real physics/lab API)
-            sim_passed = True
-            sim_score = None
-            if auto_lab:
-                # In real implementation, call a simulation API (e.g., drug binding, financial model)
-                sim_score = (oScore / 100.0) * random.uniform(0.6, 1.0)
-                sim_passed = sim_score > 0.5
-
             agent = str(random.randint(1, 500)).zfill(3)
-            veto_reason = None
+            content = f"Optimization strategy for {domain}: Increase efficiency by {random.randint(5,30)}% using {model} model."
 
-            if oScore >= threshold and (not auto_lab or sim_passed):
+            if oScore >= threshold:
                 state["lung_successes"] += 1
-                log = f"✅ [EVOLVE] {model_used} strategy (Score: {oScore}) accepted - {domain}"
-                if auto_lab:
-                    log += f" | Physics passed (Sim: {sim_score:.2f})"
+                log = f"✅ [EVOLVE] {model} logic accepted (Score: {oScore}%) - {domain}"
+                veto_reason = None
             else:
                 state["rejections"] += 1
-                if oScore < threshold:
-                    veto_reason = f"Ombudsman score {oScore} below threshold {threshold}"
-                    log = f"⛔ [VETO] {model_used} rejected (Score: {oScore} < {threshold}) - {domain}"
-                else:
-                    veto_reason = f"Physics simulation failed (Sim: {sim_score:.2f})"
-                    log = f"❌ [VETO] {model_used} passed logic but failed simulation - {domain}"
+                log = f"⛔ [VETO] Ombudsman rejected {model}. Score {oScore}% < {threshold}%"
+                veto_reason = f"Ombudsman score {oScore} below threshold {threshold}"
 
-            insert_mutation(mutation_content, oScore, model_used, domain, agent, veto_reason)
+            insert_mutation(content, oScore, model, domain, agent, veto_reason)
 
-            # Propose new layer for high‑scoring mutations
             if oScore >= 92 and random.random() > 0.85:
-                layer_names = [
-                    "AGI Alignment Kernel", "Medical ASI Diagnostic Engine", "Novus Terra Asset Tokenisation Layer",
-                    "Sovereign AI Compliance Oracle", "Predictive Health Swarm", "Zero‑Knowledge JV Auditor"
-                ]
+                layer_names = ["Quantum Encryption Substrate", "Neural Routing Bypass", "Cognitive Empathy Engine", "Recursive Strategy Matrix", "Dynamic Resource Allocator"]
                 layer_name = random.choice(layer_names)
-                layer_desc = f"Architectural breakthrough from {model_used} mutation in {domain}."
+                layer_desc = f"Architectural breakthrough generated by Swarm from {model} mutation."
                 insert_layer_proposal(layer_name, layer_desc)
                 state["pending_layers"].append({"name": layer_name, "description": layer_desc, "id": f"lyr_{len(state['pending_layers'])}"})
                 log += f" | Proposed new layer: {layer_name}"
@@ -240,7 +155,7 @@ Score:"""
             logger.error(f"Lung worker error: {e}")
         await asyncio.sleep(1.2)
 
-# ---------- API Endpoints (unchanged from previous working version) ----------
+# ---------- API Endpoints ----------
 @app.get("/api/status")
 async def get_status():
     state = get_state()
@@ -318,11 +233,12 @@ async def reject_layer(layer_id: str):
 async def health():
     return {"status": "ok", "bond": "HOLDS"}
 
+# ---------- Startup ----------
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(heart_worker())
     asyncio.create_task(lung_worker())
-    logger.info("LROS Integrated Engine started – domain‑focused AI Lung active.")
+    logger.info("LROS Integrated Engine started.")
 
 if __name__ == "__main__":
     import uvicorn
