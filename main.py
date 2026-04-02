@@ -1,5 +1,5 @@
 # ============================================================================
-# LROS – Complete Integrated Backend (Projects 1,2,3 + Pattern Library + /api/state)
+# LROS – Auto‑Approve Everything (No Button Needed)
 # ============================================================================
 
 import os
@@ -67,7 +67,6 @@ def save_state(state):
 async def ensure_initial_layer():
     state = get_state()
     if not state.get("pending_layers"):
-        # Create a default anchor layer
         result = db.table("layer_proposals").insert({
             "name": "Genesis Anchor Layer",
             "description": "Initial stability layer. Establishes baseline governance.",
@@ -79,6 +78,7 @@ async def ensure_initial_layer():
         state["pending_layers"].append({"id": layer_id, "name": "Genesis Anchor Layer", "description": "Initial stability layer. Establishes baseline governance."})
         save_state(state)
         await write_audit_log("SYSTEM_LAYER", "Created initial anchor layer", "system")
+        await auto_approve_pending_layers()   # immediately approve
 
 # ---------- AI Caller (DeepSeek + Gemini fallback) ----------
 DEEPSEEK_API_KEYS = [k.strip() for k in os.environ.get("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
@@ -146,11 +146,12 @@ def create_fallback_layer(reason: str, layer_type: str = "auto_enforced"):
         "type": layer_type,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
-    layer_id = result.data[0]["id"]   # actual Supabase UUID
+    layer_id = result.data[0]["id"]
     state = get_state()
     state["pending_layers"].append({"id": layer_id, "name": name, "description": description})
     save_state(state)
     asyncio.create_task(write_audit_log("MANDATORY_PROPOSAL_CREATED", f"Fallback layer for {reason}", "system"))
+    asyncio.create_task(auto_approve_pending_layers())   # immediately approve
 
 # ---------- Heart Worker ----------
 async def heart_worker():
@@ -182,39 +183,13 @@ async def heart_worker():
             logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Lung Worker with mandatory cycle, pattern library, refinement, and auto-approve ----------
-AUTO_APPROVE_THRESHOLD = 20   # auto‑approve when pending layers count reaches this
-
-async def auto_approve_pending_layers():
-    """Automatically approve all pending layers when count >= threshold, with bulk logging."""
-    state = get_state()
-    pending = state.get("pending_layers", [])
-    if len(pending) >= AUTO_APPROVE_THRESHOLD:
-        # Collect descriptions for backtracking log
-        approved_ids = []
-        approved_names = []
-        for layer in pending:
-            layer_id = layer.get("id")
-            if not layer_id:
-                continue
-            try:
-                await approve_layer_by_id(layer_id, auto=True)
-                approved_ids.append(layer_id)
-                approved_names.append(layer.get("name", "unknown"))
-            except Exception as e:
-                logger.error(f"Auto-approve failed for {layer_id}: {e}")
-        # Refresh state and add bulk log entry
-        state = get_state()
-        summary = f"[BULK AUTO] Approved {len(approved_ids)} layers. IDs: {', '.join(approved_ids[:5])}{'...' if len(approved_ids)>5 else ''}. Names: {', '.join(approved_names[:3])}{'...' if len(approved_names)>3 else ''}."
-        state["logs"].insert(0, summary)
-        save_state(state)
-        await write_audit_log("BULK_AUTO_APPROVE", summary, "system")
-
-async def approve_layer_by_id(layer_id: str, auto: bool = False):
-    """Core approval logic (shared between endpoint and auto-approve)."""
+# ---------- Core Approval Logic ----------
+async def approve_layer_by_id(layer_id: str, auto: bool = True):
+    """Approve a layer and update state."""
     res = db.table("layer_proposals").select("*").eq("id", layer_id).execute()
     if not res.data:
-        raise HTTPException(404, "Layer not found")
+        logger.error(f"Layer {layer_id} not found")
+        return
     layer = res.data[0]
     db.table("layer_proposals").update({
         "status": "approved",
@@ -245,13 +220,13 @@ async def approve_layer_by_id(layer_id: str, auto: bool = False):
     state["logs"].insert(0, f"[GOV] {'Auto-approved' if auto else 'Approved'} layer: {layer['name']}. +50,000 baseline. Learning +{learning_increment}%.")
     save_state(state)
 
-    # Report every 1000 layers
+    # Milestone every 1000 layers
     if state["approved_layers_count"] % 1000 == 0:
         state["logs"].insert(0, f"[MILESTONE] {state['approved_layers_count']} layers approved. System resilience increased.")
         save_state(state)
         await write_audit_log("LAYER_MILESTONE", f"{state['approved_layers_count']} layers approved", "system")
 
-    # Quorum discussion (simulated)
+    # Simulate quorum (optional, can be disabled if too heavy)
     total_agents = 200
     half = total_agents // 2
     explanation = f"Layer '{layer['name']}' approved. {layer['description']}. Advantage: {impact}"
@@ -275,13 +250,38 @@ async def approve_layer_by_id(layer_id: str, auto: bool = False):
     if state["approved_layers_count"] % 5 == 0:
         state["logs"].insert(0, f"[KNOWLEDGE EXCHANGE] {state['approved_layers_count']} layers approved. Heart and Lung exchanged learnings.")
         save_state(state)
-        asyncio.create_task(write_audit_log("KNOWLEDGE_EXCHANGE", f"Cycle {state['approved_layers_count']}", "system"))
+        await write_audit_log("KNOWLEDGE_EXCHANGE", f"Cycle {state['approved_layers_count']}", "system")
 
     if state["approved_layers_count"] % 100 == 0:
         asyncio.create_task(run_retrospective_analysis(state["approved_layers_count"]))
 
-    asyncio.create_task(write_audit_log("LAYER_APPROVED", f"Layer '{layer['name']}' approved", "governance"))
+    await write_audit_log("LAYER_APPROVED", f"Layer '{layer['name']}' approved", "governance")
 
+# ---------- Auto-approve all pending layers (no threshold) ----------
+async def auto_approve_pending_layers():
+    """Immediately approve all pending layers."""
+    state = get_state()
+    pending = state.get("pending_layers", [])
+    if not pending:
+        return
+    approved_ids = []
+    for layer in pending:
+        layer_id = layer.get("id")
+        if not layer_id:
+            continue
+        try:
+            await approve_layer_by_id(layer_id, auto=True)
+            approved_ids.append(layer_id)
+        except Exception as e:
+            logger.error(f"Auto-approve failed for {layer_id}: {e}")
+    if approved_ids:
+        state = get_state()
+        summary = f"[BULK AUTO] Approved {len(approved_ids)} layers. IDs: {', '.join(approved_ids[:5])}{'...' if len(approved_ids)>5 else ''}."
+        state["logs"].insert(0, summary)
+        save_state(state)
+        await write_audit_log("BULK_AUTO_APPROVE", summary, "system")
+
+# ---------- Lung Worker (creates mutations and proposals) ----------
 async def lung_worker():
     threshold_res = db.table("system_config").select("value").eq("key", "ombudsman_threshold").execute()
     threshold = int(threshold_res.data[0]["value"]) if threshold_res.data else 85
@@ -298,7 +298,7 @@ async def lung_worker():
                     create_fallback_layer(f"Mutation cycle {missing*5}", "mutation_mandatory")
                 set_config("last_proposal_cycle", expected)
 
-            # 2. Auto‑approve pending layers if threshold reached (bulk)
+            # 2. Immediately auto-approve any pending (already called inside create_fallback_layer, but call again to be safe)
             await auto_approve_pending_layers()
 
             # 3. Fetch context for mutation
@@ -355,7 +355,7 @@ async def lung_worker():
                 state["rejections"] += 1
                 log = f"⛔ [VETO] {model} rejected (Score: {oScore} < {threshold}) - {domain}"
                 veto_reason = f"Score {oScore} below threshold {threshold}"
-                # Attempt refinement using pattern library
+                # Attempt refinement into a new layer
                 patterns_ref = db.table("pattern_library").select("content").order("uses", desc=True).limit(2).execute()
                 if patterns_ref.data:
                     refine_prompt = f"Original vetoed mutation: {content}\nSuccessful pattern: {patterns_ref.data[0]['content']}\nEdit the original to make it more like the successful pattern, keeping domain {domain}. Output only the edited mutation."
@@ -372,7 +372,8 @@ async def lung_worker():
                         state = get_state()
                         state["pending_layers"].append({"id": layer_id, "name": "Refined mutation", "description": refined})
                         save_state(state)
-                        asyncio.create_task(write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation into new layer", "lung"))
+                        await write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation into new layer", "lung")
+                        await auto_approve_pending_layers()   # immediately approve the refined layer
 
             db.table("mutations").insert({
                 "content": content,
@@ -384,6 +385,7 @@ async def lung_worker():
                 "veto_reason": veto_reason
             }).execute()
 
+            state = get_state()
             state["logs"].insert(0, log)
             if len(state["logs"]) > 30:
                 state["logs"] = state["logs"][:30]
@@ -430,13 +432,13 @@ async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optiona
         state["logs"].insert(0, f"[VAULT] Ingested {source}. +5,000 heart successes.")
         save_state(state)
 
-        asyncio.create_task(write_audit_log("INGESTION", f"Ingested {source}", "frontend"))
+        await write_audit_log("INGESTION", f"Ingested {source}", "frontend")
         return {"status": "ingested", "mass_gain": 5000}
     except Exception as e:
         logger.error(f"Ingestion error: {e}")
         raise HTTPException(500, str(e))
 
-# ---------- Layer Endpoints ----------
+# ---------- Layer Endpoints (still available but auto-approve will override) ----------
 @app.post("/api/layers/propose")
 async def propose_layer(request: dict):
     name = request.get("name")
@@ -455,13 +457,9 @@ async def propose_layer(request: dict):
     state = get_state()
     state["pending_layers"].append({"id": layer_id, "name": name, "description": description})
     save_state(state)
-    asyncio.create_task(write_audit_log("LAYER_PROPOSED", f"Layer '{name}' proposed", "frontend"))
+    await write_audit_log("LAYER_PROPOSED", f"Layer '{name}' proposed", "frontend")
+    asyncio.create_task(auto_approve_pending_layers())   # immediate approval
     return {"status": "proposed"}
-
-@app.post("/api/layers/approve")
-async def approve_layer(layer_id: str):
-    await approve_layer_by_id(layer_id, auto=False)
-    return {"status": "approved"}
 
 @app.get("/api/layers/pending")
 async def get_pending_layers():
@@ -474,7 +472,7 @@ async def reject_layer(layer_id: str):
     state = get_state()
     state["pending_layers"] = [p for p in state.get("pending_layers", []) if p.get("id") != layer_id]
     save_state(state)
-    asyncio.create_task(write_audit_log("LAYER_REJECTED", f"Layer {layer_id} rejected", "governance"))
+    await write_audit_log("LAYER_REJECTED", f"Layer {layer_id} rejected", "governance")
     return {"status": "rejected"}
 
 # ---------- Retrospective Analysis ----------
@@ -510,6 +508,7 @@ async def run_retrospective_analysis(cycle_number):
             state = get_state()
             state["pending_layers"].append({"id": layer_id, "name": prop["name"], "description": prop["description"]})
             save_state(state)
+            await auto_approve_pending_layers()
     except Exception as e:
         logger.error(f"Retrospective analysis failed: {e}")
     total_agents = 200
@@ -522,7 +521,7 @@ async def run_retrospective_analysis(cycle_number):
             "round": 0,
             "sent_at": datetime.utcnow().isoformat()
         }).execute()
-    asyncio.create_task(write_audit_log("RETROSPECTIVE_ANALYSIS", f"Cycle {cycle_number}: Analyzed {len(vetoed.data)} vetoes", "system"))
+    await write_audit_log("RETROSPECTIVE_ANALYSIS", f"Cycle {cycle_number}: Analyzed {len(vetoed.data)} vetoes", "system")
 
 # ---------- Secure Baseline ----------
 @app.post("/api/lung/secure_baseline")
@@ -544,7 +543,7 @@ async def secure_baseline():
         "lung_total": 0,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
-    asyncio.create_task(write_audit_log("BASELINE_ANCHOR", f"Baseline locked to {total}", "user"))
+    await write_audit_log("BASELINE_ANCHOR", f"Baseline locked to {total}", "user")
     return {"status": "success", "new_baseline": total}
 
 # ---------- EOD Report Generation ----------
@@ -581,14 +580,30 @@ async def generate_eod_report():
 async def schedule_eod():
     while True:
         now = datetime.utcnow()
-        # Naive UTC: next run at 23:59:00 UTC today or tomorrow
         next_run = datetime(now.year, now.month, now.day, 23, 59, 0)
         if now >= next_run:
             next_run += timedelta(days=1)
         await asyncio.sleep((next_run - now).total_seconds())
         await generate_eod_report()
 
-# ---------- API Endpoints ----------
+# ---------- Debug Endpoint ----------
+@app.post("/api/debug/create_layer")
+async def debug_create_layer():
+    result = db.table("layer_proposals").insert({
+        "name": "Debug Test Layer",
+        "description": "Created via debug endpoint for testing auto-approval.",
+        "status": "pending",
+        "type": "debug",
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    layer_id = result.data[0]["id"]
+    state = get_state()
+    state["pending_layers"].append({"id": layer_id, "name": "Debug Test Layer", "description": "Created via debug endpoint for testing auto-approval."})
+    save_state(state)
+    await auto_approve_pending_layers()
+    return {"status": "layer_created_and_auto_approved", "layer_id": layer_id}
+
+# ---------- API Endpoints (existing) ----------
 @app.get("/api/status")
 async def get_status():
     state = get_state()
@@ -647,11 +662,11 @@ async def check_mandatory_cycles():
 # ---------- Startup ----------
 @app.on_event("startup")
 async def startup():
-    await ensure_initial_layer()   # Do a layer
+    await ensure_initial_layer()
     asyncio.create_task(heart_worker())
     asyncio.create_task(lung_worker())
     asyncio.create_task(schedule_eod())
-    logger.info("LROS Sovereign Engine started with full Projects 1,2,3 and pattern library.")
+    logger.info("LROS Sovereign Engine started – Auto-approve always on.")
 
 if __name__ == "__main__":
     import uvicorn
