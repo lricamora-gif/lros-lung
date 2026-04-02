@@ -1,5 +1,6 @@
 # ============================================================================
-# LROS – Complete Integrated Backend (Auto‑Approve + Cleanup + No Timezone Issues)
+# LROS – Complete Final Backend
+# Auto‑approval threshold = 5, 15 parallel approval workers, cleanup, monitoring
 # ============================================================================
 
 import os
@@ -18,7 +19,6 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Sovereign")
 
-# ---------- FastAPI App ----------
 app = FastAPI(title="LROS Sovereign Engine")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -28,6 +28,10 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise Exception("Missing SUPABASE_URL or SUPABASE_KEY")
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ---------- Constants ----------
+AUTO_APPROVE_THRESHOLD = 5          # Trigger auto-approval when pending >= 5
+APPROVAL_WORKERS_COUNT = 15         # Number of parallel approval workers (10–20)
 
 # ---------- Helper: Write Audit Log ----------
 async def write_audit_log(event_type, description, source, metadata=None):
@@ -64,10 +68,10 @@ def get_state():
 def save_state(state):
     db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
 
-# ---------- Ensure at least one valid pending layer on startup ----------
+# ---------- Ensure initial valid pending layer ----------
 async def ensure_initial_layer():
     state = get_state()
-    # Remove any invalid IDs from pending_layers
+    # Remove invalid IDs from pending_layers
     valid = []
     for layer in state.get("pending_layers", []):
         layer_id = layer.get("id")
@@ -95,7 +99,6 @@ async def ensure_initial_layer():
         state["pending_layers"].append({"id": layer_id, "name": "Genesis Anchor Layer", "description": "Initial stability layer. Establishes baseline governance."})
         save_state(state)
         await write_audit_log("SYSTEM_LAYER", "Created initial anchor layer", "system")
-        await auto_approve_pending_layers()   # immediately approve
 
 # ---------- AI Caller (DeepSeek + Gemini fallback) ----------
 DEEPSEEK_API_KEYS = [k.strip() for k in os.environ.get("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
@@ -136,7 +139,7 @@ def call_ai(prompt: str, temperature: float = 0.7) -> str:
                 continue
     return "[Simulated] No AI key available."
 
-# ---------- Cycle Counters (stored in system_config) ----------
+# ---------- Cycle Counters ----------
 def get_config_int(key, default=0):
     res = db.table("system_config").select("value").eq("key", key).execute()
     if res.data:
@@ -168,7 +171,6 @@ def create_fallback_layer(reason: str, layer_type: str = "auto_enforced"):
     state["pending_layers"].append({"id": layer_id, "name": name, "description": description})
     save_state(state)
     asyncio.create_task(write_audit_log("MANDATORY_PROPOSAL_CREATED", f"Fallback layer for {reason}", "system"))
-    asyncio.create_task(auto_approve_pending_layers())
 
 # ---------- Heart Worker ----------
 async def heart_worker():
@@ -200,14 +202,25 @@ async def heart_worker():
             logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Core Approval Logic ----------
+# ---------- Core Approval Logic (idempotent, fast for auto) ----------
 async def approve_layer_by_id(layer_id: str, auto: bool = True):
-    """Approve a layer and update state."""
-    res = db.table("layer_proposals").select("*").eq("id", layer_id).execute()
-    if not res.data:
+    """Approve a layer – idempotent, skips heavy ops for auto."""
+    # Check if already approved
+    check = db.table("layer_proposals").select("status").eq("id", layer_id).execute()
+    if not check.data:
         logger.error(f"Layer {layer_id} not found")
         return
+    if check.data[0]["status"] == "approved":
+        logger.info(f"Layer {layer_id} already approved – skipping duplicate")
+        return
+
+    # Fetch full layer data
+    res = db.table("layer_proposals").select("*").eq("id", layer_id).execute()
+    if not res.data:
+        return
     layer = res.data[0]
+
+    # Update status
     db.table("layer_proposals").update({
         "status": "approved",
         "approved_at": datetime.utcnow().isoformat()
@@ -243,26 +256,29 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
         save_state(state)
         await write_audit_log("LAYER_MILESTONE", f"{state['approved_layers_count']} layers approved", "system")
 
-    # Simulate quorum (optional)
-    total_agents = 200
-    half = total_agents // 2
-    explanation = f"Layer '{layer['name']}' approved. {layer['description']}. Advantage: {impact}"
-    for i in range(1, half+1):
-        db.table("agent_messages").insert({
-            "layer_id": layer["id"],
-            "agent_id": str(i),
-            "message": explanation,
-            "round": 1,
-            "sent_at": datetime.utcnow().isoformat()
-        }).execute()
-    for i in range(half+1, total_agents+1):
-        db.table("agent_messages").insert({
-            "layer_id": layer["id"],
-            "agent_id": str(i),
-            "message": f"Agent {random.randint(1,half)} explained: {explanation}",
-            "round": 2,
-            "sent_at": datetime.utcnow().isoformat()
-        }).execute()
+    # Quorum simulation – only for manual approvals (skip for auto to save time)
+    if not auto:
+        total_agents = 200
+        half = total_agents // 2
+        explanation = f"Layer '{layer['name']}' approved. {layer['description']}. Advantage: {impact}"
+        for i in range(1, half+1):
+            db.table("agent_messages").insert({
+                "layer_id": layer["id"],
+                "agent_id": str(i),
+                "message": explanation,
+                "round": 1,
+                "sent_at": datetime.utcnow().isoformat()
+            }).execute()
+        for i in range(half+1, total_agents+1):
+            db.table("agent_messages").insert({
+                "layer_id": layer["id"],
+                "agent_id": str(i),
+                "message": f"Agent {random.randint(1,half)} explained: {explanation}",
+                "round": 2,
+                "sent_at": datetime.utcnow().isoformat()
+            }).execute()
+    else:
+        logger.debug(f"Auto-approved layer {layer_id} – quorum skipped.")
 
     if state["approved_layers_count"] % 5 == 0:
         state["logs"].insert(0, f"[KNOWLEDGE EXCHANGE] {state['approved_layers_count']} layers approved. Heart and Lung exchanged learnings.")
@@ -274,52 +290,26 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
 
     await write_audit_log("LAYER_APPROVED", f"Layer '{layer['name']}' approved", "governance")
 
-# ---------- Auto-approve all pending layers (with validation) ----------
-async def auto_approve_pending_layers():
-    """Approve all valid pending layers, remove invalid ones."""
-    state = get_state()
-    pending = state.get("pending_layers", [])
-    if not pending:
-        return
-
-    valid_ids = []
-    invalid_ids = []
-
-    for layer in pending:
-        layer_id = layer.get("id")
-        if not layer_id:
-            invalid_ids.append(layer)
-            continue
+# ---------- Approval Worker (one of many parallel instances) ----------
+async def approval_worker(worker_id: int):
+    """Single approval worker – processes pending layers continuously."""
+    while True:
         try:
-            res = db.table("layer_proposals").select("id").eq("id", layer_id).execute()
-            if res.data:
-                valid_ids.append(layer)
+            state = get_state()
+            pending = state.get("pending_layers", [])
+            # Use threshold to decide whether to process
+            if len(pending) >= AUTO_APPROVE_THRESHOLD:
+                # Take the oldest layer
+                layer = pending[0]
+                layer_id = layer.get("id")
+                if layer_id:
+                    await approve_layer_by_id(layer_id, auto=True)
+                await asyncio.sleep(0.1)  # brief pause to avoid state conflict
             else:
-                invalid_ids.append(layer)
+                await asyncio.sleep(1)   # no urgent work
         except Exception as e:
-            logger.warning(f"ID check failed for {layer_id}: {e}")
-            invalid_ids.append(layer)
-
-    if invalid_ids:
-        state["pending_layers"] = valid_ids
-        save_state(state)
-        logger.info(f"Removed {len(invalid_ids)} invalid pending layers (IDs like {[l.get('id') for l in invalid_ids[:5]]})")
-        await write_audit_log("CLEANUP", f"Removed {len(invalid_ids)} invalid pending layer entries", "system")
-
-    approved_count = 0
-    for layer in valid_ids:
-        layer_id = layer.get("id")
-        try:
-            await approve_layer_by_id(layer_id, auto=True)
-            approved_count += 1
-        except Exception as e:
-            logger.error(f"Auto-approve failed for {layer_id}: {e}")
-
-    if approved_count:
-        state = get_state()
-        state["logs"].insert(0, f"[BULK AUTO] Approved {approved_count} valid layers.")
-        save_state(state)
-        await write_audit_log("BULK_AUTO_APPROVE", f"Approved {approved_count} layers", "system")
+            logger.error(f"Approval worker {worker_id} error: {e}")
+            await asyncio.sleep(1)
 
 # ---------- Lung Worker (creates mutations and proposals) ----------
 async def lung_worker():
@@ -338,10 +328,7 @@ async def lung_worker():
                     create_fallback_layer(f"Mutation cycle {missing*5}", "mutation_mandatory")
                 set_config("last_proposal_cycle", expected)
 
-            # 2. Auto-approve any pending layers
-            await auto_approve_pending_layers()
-
-            # 3. Fetch context for mutation
+            # 2. Fetch context for mutation
             approved_layers = db.table("layer_proposals").select("name","description").eq("status","approved").order("approved_at", desc=True).limit(5).execute()
             vault = db.table("knowledge_vault").select("content").limit(5).execute()
             patterns = db.table("pattern_library").select("content","domain").order("uses", desc=True).limit(3).execute()
@@ -360,7 +347,7 @@ async def lung_worker():
             if not content or content.startswith("[Simulated]"):
                 content = f"Optimization strategy for {domain}: Increase efficiency by {random.randint(5,30)}% using {model} model."
 
-            # 4. Ombudsman scoring
+            # 3. Ombudsman scoring
             score_prompt = f"Rate the following strategy from 0 to 100 (100 = perfect). Return only integer score.\nStrategy: {content}\nScore:"
             score_resp = call_ai(score_prompt, temperature=0.2)
             try:
@@ -413,7 +400,6 @@ async def lung_worker():
                         state["pending_layers"].append({"id": layer_id, "name": "Refined mutation", "description": refined})
                         save_state(state)
                         await write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation into new layer", "lung")
-                        await auto_approve_pending_layers()
 
             db.table("mutations").insert({
                 "content": content,
@@ -498,13 +484,17 @@ async def propose_layer(request: dict):
     state["pending_layers"].append({"id": layer_id, "name": name, "description": description})
     save_state(state)
     await write_audit_log("LAYER_PROPOSED", f"Layer '{name}' proposed", "frontend")
-    asyncio.create_task(auto_approve_pending_layers())
     return {"status": "proposed"}
 
 @app.get("/api/layers/pending")
 async def get_pending_layers():
     state = get_state()
     return state.get("pending_layers", [])
+
+@app.post("/api/layers/approve")
+async def approve_layer(layer_id: str):
+    await approve_layer_by_id(layer_id, auto=False)
+    return {"status": "approved"}
 
 @app.post("/api/layers/reject")
 async def reject_layer(layer_id: str):
@@ -548,7 +538,6 @@ async def run_retrospective_analysis(cycle_number):
             state = get_state()
             state["pending_layers"].append({"id": layer_id, "name": prop["name"], "description": prop["description"]})
             save_state(state)
-            await auto_approve_pending_layers()
     except Exception as e:
         logger.error(f"Retrospective analysis failed: {e}")
     total_agents = 200
@@ -626,10 +615,10 @@ async def schedule_eod():
         await asyncio.sleep((next_run - now).total_seconds())
         await generate_eod_report()
 
-# ---------- Admin Cleanup Endpoint ----------
+# ---------- Admin Endpoints ----------
 @app.post("/api/admin/cleanup_pending_layers")
 async def admin_cleanup_pending_layers():
-    """Remove all invalid pending layer entries and optionally re‑create a safe anchor."""
+    """Remove invalid pending layer entries and create a safe anchor if empty."""
     state = get_state()
     old_pending = state.get("pending_layers", [])
     valid_pending = []
@@ -663,13 +652,25 @@ async def admin_cleanup_pending_layers():
         new_id = result.data[0]["id"]
         state["pending_layers"].append({"id": new_id, "name": "Safe Anchor Layer", "description": "Auto‑created after cleanup to ensure system continuity."})
         save_state(state)
-        await auto_approve_pending_layers()
 
     await write_audit_log("ADMIN_CLEANUP", f"Removed {len(removed)} invalid entries. Kept {len(valid_pending)}.", "admin")
     return {
         "removed_count": len(removed),
         "kept_count": len(valid_pending),
         "removed_examples": [l.get("id") for l in removed[:10]]
+    }
+
+@app.get("/api/admin/queue_status")
+async def queue_status():
+    state = get_state()
+    pending = state.get("pending_layers", [])
+    return {
+        "pending_count": len(pending),
+        "latest_pending_ids": [p.get("id") for p in pending[:5]],
+        "approved_layers_count": state.get("approved_layers_count", 0),
+        "lung_successes": state.get("lung_successes", 0),
+        "threshold": AUTO_APPROVE_THRESHOLD,
+        "workers": APPROVAL_WORKERS_COUNT
     }
 
 # ---------- Debug Endpoint (optional) ----------
@@ -686,10 +687,9 @@ async def debug_create_layer():
     state = get_state()
     state["pending_layers"].append({"id": layer_id, "name": "Debug Test Layer", "description": "Created via debug endpoint for testing auto-approval."})
     save_state(state)
-    await auto_approve_pending_layers()
-    return {"status": "layer_created_and_auto_approved", "layer_id": layer_id}
+    return {"status": "layer_created", "layer_id": layer_id}
 
-# ---------- API Endpoints (status, mutations, state, etc.) ----------
+# ---------- Public API Endpoints ----------
 @app.get("/api/status")
 async def get_status():
     state = get_state()
@@ -751,8 +751,11 @@ async def startup():
     await ensure_initial_layer()
     asyncio.create_task(heart_worker())
     asyncio.create_task(lung_worker())
+    # Start 15 parallel approval workers
+    for i in range(APPROVAL_WORKERS_COUNT):
+        asyncio.create_task(approval_worker(i))
     asyncio.create_task(schedule_eod())
-    logger.info("LROS Sovereign Engine started – Auto-approve always on, invalid IDs cleaned.")
+    logger.info(f"LROS Sovereign Engine started – threshold={AUTO_APPROVE_THRESHOLD}, workers={APPROVAL_WORKERS_COUNT}")
 
 if __name__ == "__main__":
     import uvicorn
