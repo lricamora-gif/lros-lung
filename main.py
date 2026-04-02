@@ -1,6 +1,7 @@
 # ============================================================================
-# LROS – Complete Final Backend
-# Auto‑approval threshold = 5, 15 parallel approval workers, cleanup, monitoring
+# LROS – Complete Final Backend (One‑Button Play)
+# Auto‑approval threshold = env or 5, workers = env or 15
+# Includes diagnostic, threshold adjust, force mutation, reset counters
 # ============================================================================
 
 import os
@@ -29,9 +30,9 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise Exception("Missing SUPABASE_URL or SUPABASE_KEY")
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- Constants ----------
-AUTO_APPROVE_THRESHOLD = 5          # Trigger auto-approval when pending >= 5
-APPROVAL_WORKERS_COUNT = 15         # Number of parallel approval workers (10–20)
+# ---------- Environment‑tuned constants ----------
+AUTO_APPROVE_THRESHOLD = int(os.environ.get("AUTO_APPROVE_THRESHOLD", "5"))
+APPROVAL_WORKERS_COUNT = int(os.environ.get("APPROVAL_WORKERS_COUNT", "15"))
 
 # ---------- Helper: Write Audit Log ----------
 async def write_audit_log(event_type, description, source, metadata=None):
@@ -48,13 +49,13 @@ def get_state():
     res = db.table("sovereign_state").select("state_data").eq("id", 1).execute()
     if not res.data:
         default = {
-            "baseline_anchor": 1008922,
-            "heart_successes": 1027965,
-            "lung_successes": 45429,
-            "rejections": 4115,
-            "uses": 195700000,
-            "daily_learning": 2921731.39,
-            "active_agent": "244",
+            "baseline_anchor": 1000000,
+            "heart_successes": 0,
+            "lung_successes": 0,
+            "rejections": 0,
+            "uses": 0,
+            "daily_learning": 0,
+            "active_agent": "000",
             "mutation_ledger": [],
             "logs": [],
             "pending_layers": [],
@@ -71,7 +72,6 @@ def save_state(state):
 # ---------- Ensure initial valid pending layer ----------
 async def ensure_initial_layer():
     state = get_state()
-    # Remove invalid IDs from pending_layers
     valid = []
     for layer in state.get("pending_layers", []):
         layer_id = layer.get("id")
@@ -86,7 +86,6 @@ async def ensure_initial_layer():
     if len(valid) != len(state.get("pending_layers", [])):
         state["pending_layers"] = valid
         save_state(state)
-        logger.info(f"Cleaned {len(state.get('pending_layers', [])) - len(valid)} invalid pending layers on startup")
     if not state.get("pending_layers"):
         result = db.table("layer_proposals").insert({
             "name": "Genesis Anchor Layer",
@@ -96,7 +95,7 @@ async def ensure_initial_layer():
             "created_at": datetime.utcnow().isoformat()
         }).execute()
         layer_id = result.data[0]["id"]
-        state["pending_layers"].append({"id": layer_id, "name": "Genesis Anchor Layer", "description": "Initial stability layer. Establishes baseline governance."})
+        state["pending_layers"].append({"id": layer_id, "name": "Genesis Anchor Layer", "description": "Initial stability layer."})
         save_state(state)
         await write_audit_log("SYSTEM_LAYER", "Created initial anchor layer", "system")
 
@@ -155,10 +154,10 @@ def inc_config(key):
 def set_config(key, val):
     db.table("system_config").upsert({"key": key, "value": str(val)}).execute()
 
-# ---------- Mandatory Layer Generator (stores real UUID) ----------
+# ---------- Mandatory Layer Generator ----------
 def create_fallback_layer(reason: str, layer_type: str = "auto_enforced"):
     name = f"Cycle‑enforced improvement ({reason})"
-    description = "Automatically generated to comply with mandatory layer rule. Adjusts system for better stability."
+    description = "Automatically generated to comply with mandatory layer rule."
     result = db.table("layer_proposals").insert({
         "name": name,
         "description": description,
@@ -204,29 +203,23 @@ async def heart_worker():
 
 # ---------- Core Approval Logic (idempotent, fast for auto) ----------
 async def approve_layer_by_id(layer_id: str, auto: bool = True):
-    """Approve a layer – idempotent, skips heavy ops for auto."""
-    # Check if already approved
     check = db.table("layer_proposals").select("status").eq("id", layer_id).execute()
     if not check.data:
         logger.error(f"Layer {layer_id} not found")
         return
     if check.data[0]["status"] == "approved":
-        logger.info(f"Layer {layer_id} already approved – skipping duplicate")
         return
 
-    # Fetch full layer data
     res = db.table("layer_proposals").select("*").eq("id", layer_id).execute()
     if not res.data:
         return
     layer = res.data[0]
 
-    # Update status
     db.table("layer_proposals").update({
         "status": "approved",
         "approved_at": datetime.utcnow().isoformat()
     }).eq("id", layer_id).execute()
 
-    # Apply layer impact
     name = layer["name"].lower()
     desc = layer["description"].lower()
     impact = "System performance improved."
@@ -250,13 +243,12 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
     state["logs"].insert(0, f"[GOV] {'Auto-approved' if auto else 'Approved'} layer: {layer['name']}. +50,000 baseline. Learning +{learning_increment}%.")
     save_state(state)
 
-    # Milestone every 1000 layers
     if state["approved_layers_count"] % 1000 == 0:
-        state["logs"].insert(0, f"[MILESTONE] {state['approved_layers_count']} layers approved. System resilience increased.")
+        state["logs"].insert(0, f"[MILESTONE] {state['approved_layers_count']} layers approved.")
         save_state(state)
         await write_audit_log("LAYER_MILESTONE", f"{state['approved_layers_count']} layers approved", "system")
 
-    # Quorum simulation – only for manual approvals (skip for auto to save time)
+    # Quorum only for manual approvals
     if not auto:
         total_agents = 200
         half = total_agents // 2
@@ -277,11 +269,9 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
                 "round": 2,
                 "sent_at": datetime.utcnow().isoformat()
             }).execute()
-    else:
-        logger.debug(f"Auto-approved layer {layer_id} – quorum skipped.")
 
     if state["approved_layers_count"] % 5 == 0:
-        state["logs"].insert(0, f"[KNOWLEDGE EXCHANGE] {state['approved_layers_count']} layers approved. Heart and Lung exchanged learnings.")
+        state["logs"].insert(0, f"[KNOWLEDGE EXCHANGE] {state['approved_layers_count']} layers approved.")
         save_state(state)
         await write_audit_log("KNOWLEDGE_EXCHANGE", f"Cycle {state['approved_layers_count']}", "system")
 
@@ -290,36 +280,31 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
 
     await write_audit_log("LAYER_APPROVED", f"Layer '{layer['name']}' approved", "governance")
 
-# ---------- Approval Worker (one of many parallel instances) ----------
+# ---------- Approval Worker (parallel) ----------
 async def approval_worker(worker_id: int):
-    """Single approval worker – processes pending layers continuously."""
     while True:
         try:
             state = get_state()
             pending = state.get("pending_layers", [])
-            # Use threshold to decide whether to process
             if len(pending) >= AUTO_APPROVE_THRESHOLD:
-                # Take the oldest layer
                 layer = pending[0]
                 layer_id = layer.get("id")
                 if layer_id:
                     await approve_layer_by_id(layer_id, auto=True)
-                await asyncio.sleep(0.1)  # brief pause to avoid state conflict
+                await asyncio.sleep(0.1)
             else:
-                await asyncio.sleep(1)   # no urgent work
+                await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Approval worker {worker_id} error: {e}")
             await asyncio.sleep(1)
 
-# ---------- Lung Worker (creates mutations and proposals) ----------
+# ---------- Lung Worker ----------
 async def lung_worker():
-    threshold_res = db.table("system_config").select("value").eq("key", "ombudsman_threshold").execute()
-    threshold = int(threshold_res.data[0]["value"]) if threshold_res.data else 85
+    threshold = get_config_int("ombudsman_threshold", 85)
     models = ["deepseek", "mistral", "groq", "gemini", "cerebras"]
     domains = ["Medical Innovation", "Longevity Science", "Regulatory Compliance", "Venture Architecture"]
     while True:
         try:
-            # 1. Mandatory layer enforcement
             mutation_cycle = inc_config("mutation_cycle")
             last_proposal = get_config_int("last_proposal_cycle")
             expected = mutation_cycle // 5
@@ -328,7 +313,6 @@ async def lung_worker():
                     create_fallback_layer(f"Mutation cycle {missing*5}", "mutation_mandatory")
                 set_config("last_proposal_cycle", expected)
 
-            # 2. Fetch context for mutation
             approved_layers = db.table("layer_proposals").select("name","description").eq("status","approved").order("approved_at", desc=True).limit(5).execute()
             vault = db.table("knowledge_vault").select("content").limit(5).execute()
             patterns = db.table("pattern_library").select("content","domain").order("uses", desc=True).limit(3).execute()
@@ -338,17 +322,16 @@ async def lung_worker():
             if vault.data:
                 context += "Recent knowledge: " + "; ".join([v["content"][:100] for v in vault.data]) + "\n"
             if patterns.data:
-                context += "Successful patterns (use similar style):\n" + "\n".join([f"- {p['content']} (domain: {p['domain']})" for p in patterns.data]) + "\n"
+                context += "Successful patterns:\n" + "\n".join([f"- {p['content']} (domain: {p['domain']})" for p in patterns.data]) + "\n"
 
             domain = random.choice(domains)
             model = random.choice(models)
-            prompt = f"Generate a novel mutation strategy in domain: {domain}. Use the following context to improve quality:\n{context}\nStrategy:"
+            prompt = f"Generate a novel mutation strategy in domain: {domain}. Use context:\n{context}\nStrategy:"
             content = call_ai(prompt, temperature=0.8)
             if not content or content.startswith("[Simulated]"):
                 content = f"Optimization strategy for {domain}: Increase efficiency by {random.randint(5,30)}% using {model} model."
 
-            # 3. Ombudsman scoring
-            score_prompt = f"Rate the following strategy from 0 to 100 (100 = perfect). Return only integer score.\nStrategy: {content}\nScore:"
+            score_prompt = f"Rate from 0 to 100 (100 perfect). Return only integer.\nStrategy: {content}\nScore:"
             score_resp = call_ai(score_prompt, temperature=0.2)
             try:
                 oScore = int(score_resp.strip())
@@ -357,12 +340,11 @@ async def lung_worker():
                 oScore = random.randint(50, 100)
 
             agent = str(random.randint(1, 500)).zfill(3)
+            state = get_state()
             if oScore >= threshold:
-                state = get_state()
                 state["lung_successes"] += 1
                 log = f"✅ [EVOLVE] {model} accepted (Score: {oScore}) - {domain}"
                 veto_reason = None
-                # Add to pattern library
                 existing = db.table("pattern_library").select("id").eq("content", content).eq("domain", domain).execute()
                 if existing.data:
                     db.table("pattern_library").update({
@@ -378,14 +360,12 @@ async def lung_worker():
                         "created_at": datetime.utcnow().isoformat()
                     }).execute()
             else:
-                state = get_state()
                 state["rejections"] += 1
                 log = f"⛔ [VETO] {model} rejected (Score: {oScore} < {threshold}) - {domain}"
-                veto_reason = f"Score {oScore} below threshold {threshold}"
-                # Attempt refinement into a new layer
+                veto_reason = f"Score {oScore} below threshold"
                 patterns_ref = db.table("pattern_library").select("content").order("uses", desc=True).limit(2).execute()
                 if patterns_ref.data:
-                    refine_prompt = f"Original vetoed mutation: {content}\nSuccessful pattern: {patterns_ref.data[0]['content']}\nEdit the original to make it more like the successful pattern, keeping domain {domain}. Output only the edited mutation."
+                    refine_prompt = f"Original vetoed: {content}\nSuccessful pattern: {patterns_ref.data[0]['content']}\nEdit original to be more like pattern, keep domain {domain}. Output only edited mutation."
                     refined = call_ai(refine_prompt, temperature=0.7)
                     if refined and refined != content:
                         result = db.table("layer_proposals").insert({
@@ -396,10 +376,9 @@ async def lung_worker():
                             "created_at": datetime.utcnow().isoformat()
                         }).execute()
                         layer_id = result.data[0]["id"]
-                        state = get_state()
                         state["pending_layers"].append({"id": layer_id, "name": "Refined mutation", "description": refined})
                         save_state(state)
-                        await write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation into new layer", "lung")
+                        await write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation", "lung")
 
             db.table("mutations").insert({
                 "content": content,
@@ -411,7 +390,6 @@ async def lung_worker():
                 "veto_reason": veto_reason
             }).execute()
 
-            state = get_state()
             state["logs"].insert(0, log)
             if len(state["logs"]) > 30:
                 state["logs"] = state["logs"][:30]
@@ -420,7 +398,54 @@ async def lung_worker():
             logger.error(f"Lung worker error: {e}")
         await asyncio.sleep(1.2)
 
-# ---------- Ingestion Endpoint ----------
+# ---------- Retrospective Analysis ----------
+async def run_retrospective_analysis(cycle_number):
+    vetoed = db.table("mutations").select("content","score","veto_reason","domain").lt("score",85).order("timestamp", desc=True).limit(200).execute()
+    if not vetoed.data:
+        return
+    error_counts = {}
+    for m in vetoed.data:
+        reason = m.get("veto_reason") or f"Score {m['score']} below threshold"
+        error_counts[reason] = error_counts.get(reason, 0) + 1
+    top_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    for err, freq in top_errors:
+        db.table("error_analysis").insert({
+            "cycle_number": cycle_number,
+            "error_pattern": err,
+            "frequency": freq,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+    prompt = f"Top errors causing rejections: {top_errors}. Propose 5 layer improvements (name, description) as JSON array."
+    try:
+        response = call_ai(prompt, temperature=0.7)
+        proposals = json.loads(response)
+        for prop in proposals[:5]:
+            result = db.table("layer_proposals").insert({
+                "name": prop["name"],
+                "description": prop["description"],
+                "status": "pending",
+                "type": "error_prevention",
+                "created_at": datetime.utcnow().isoformat()
+            }).execute()
+            layer_id = result.data[0]["id"]
+            state = get_state()
+            state["pending_layers"].append({"id": layer_id, "name": prop["name"], "description": prop["description"]})
+            save_state(state)
+    except Exception as e:
+        logger.error(f"Retrospective analysis failed: {e}")
+    total_agents = 200
+    msg = f"Retrospective Cycle {cycle_number}: Top errors: {top_errors[0][0] if top_errors else 'none'}. New layers proposed."
+    for i in range(1, total_agents+1):
+        db.table("agent_messages").insert({
+            "layer_id": None,
+            "agent_id": str(i),
+            "message": msg,
+            "round": 0,
+            "sent_at": datetime.utcnow().isoformat()
+        }).execute()
+    await write_audit_log("RETROSPECTIVE_ANALYSIS", f"Cycle {cycle_number}: Analyzed {len(vetoed.data)} vetoes", "system")
+
+# ---------- Endpoints ----------
 @app.post("/api/ingest")
 async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optional[str] = Form(None), text: Optional[str] = Form(None)):
     try:
@@ -436,13 +461,11 @@ async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optiona
             source = "Raw text"
         else:
             raise HTTPException(400, "No file, URL, or text provided")
-
         db.table("knowledge_vault").insert({
             "content": content,
             "source": source,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
-
         ingestion_cycle = inc_config("ingestion_cycle")
         last_proposal = get_config_int("last_proposal_cycle")
         expected = ingestion_cycle // 5
@@ -450,21 +473,18 @@ async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optiona
             for missing in range(last_proposal + 1, expected + 1):
                 create_fallback_layer(f"Ingestion cycle {missing*5}", "ingestion_mandatory")
             set_config("last_proposal_cycle", expected)
-
         state = get_state()
         state["heart_successes"] += 5000
         state["uses"] += 25000
         state["daily_learning"] += 500.5
         state["logs"].insert(0, f"[VAULT] Ingested {source}. +5,000 heart successes.")
         save_state(state)
-
         await write_audit_log("INGESTION", f"Ingested {source}", "frontend")
         return {"status": "ingested", "mass_gain": 5000}
     except Exception as e:
         logger.error(f"Ingestion error: {e}")
         raise HTTPException(500, str(e))
 
-# ---------- Layer Endpoints ----------
 @app.post("/api/layers/propose")
 async def propose_layer(request: dict):
     name = request.get("name")
@@ -505,54 +525,6 @@ async def reject_layer(layer_id: str):
     await write_audit_log("LAYER_REJECTED", f"Layer {layer_id} rejected", "governance")
     return {"status": "rejected"}
 
-# ---------- Retrospective Analysis ----------
-async def run_retrospective_analysis(cycle_number):
-    vetoed = db.table("mutations").select("content","score","veto_reason","domain").lt("score",85).order("timestamp", desc=True).limit(200).execute()
-    if not vetoed.data:
-        return
-    error_counts = {}
-    for m in vetoed.data:
-        reason = m.get("veto_reason") or f"Score {m['score']} below threshold"
-        error_counts[reason] = error_counts.get(reason, 0) + 1
-    top_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    for err, freq in top_errors:
-        db.table("error_analysis").insert({
-            "cycle_number": cycle_number,
-            "error_pattern": err,
-            "frequency": freq,
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
-    prompt = f"Top errors causing mutation rejections: {top_errors}. Propose 5 layer improvements (name, description) to avoid these errors. Output JSON array."
-    try:
-        response = call_ai(prompt, temperature=0.7)
-        proposals = json.loads(response)
-        for prop in proposals[:5]:
-            result = db.table("layer_proposals").insert({
-                "name": prop["name"],
-                "description": prop["description"],
-                "status": "pending",
-                "type": "error_prevention",
-                "created_at": datetime.utcnow().isoformat()
-            }).execute()
-            layer_id = result.data[0]["id"]
-            state = get_state()
-            state["pending_layers"].append({"id": layer_id, "name": prop["name"], "description": prop["description"]})
-            save_state(state)
-    except Exception as e:
-        logger.error(f"Retrospective analysis failed: {e}")
-    total_agents = 200
-    msg = f"Retrospective Cycle {cycle_number}: Top errors: {top_errors[0][0] if top_errors else 'none'}. New error‑prevention layers proposed."
-    for i in range(1, total_agents+1):
-        db.table("agent_messages").insert({
-            "layer_id": None,
-            "agent_id": str(i),
-            "message": msg,
-            "round": 0,
-            "sent_at": datetime.utcnow().isoformat()
-        }).execute()
-    await write_audit_log("RETROSPECTIVE_ANALYSIS", f"Cycle {cycle_number}: Analyzed {len(vetoed.data)} vetoes", "system")
-
-# ---------- Secure Baseline ----------
 @app.post("/api/lung/secure_baseline")
 async def secure_baseline():
     state = get_state()
@@ -575,55 +547,88 @@ async def secure_baseline():
     await write_audit_log("BASELINE_ANCHOR", f"Baseline locked to {total}", "user")
     return {"status": "success", "new_baseline": total}
 
-# ---------- EOD Report Generation ----------
-async def generate_eod_report():
-    now = datetime.utcnow()
-    today = now.date()
-    approved_today = db.table("layer_proposals").select("id").eq("status","approved").gte("approved_at", f"{today}T00:00:00Z").execute()
-    total_approved = len(approved_today.data)
-    improvements = db.table("layer_proposals").select("id").eq("type","error_prevention").gte("approved_at", f"{today}T00:00:00Z").execute()
+# ---------- Admin & Diagnostic Endpoints ----------
+@app.get("/api/admin/diagnostic")
+async def diagnostic():
     state = get_state()
-    learning = state.get("daily_learning", 0)
-    top_errors = db.table("error_analysis").select("error_pattern","frequency").order("created_at", desc=True).limit(3).execute()
-    report_text = f"EOD Report {today}\nTotal layers approved today: {total_approved}\nImprovements (error‑prevention): {len(improvements.data)}\nTop errors: {top_errors.data if top_errors.data else 'none'}\nLearning progress: {learning:.2f}%"
-    db.table("eod_reports").insert({
-        "report_date": today.isoformat(),
-        "total_layers_approved": total_approved,
-        "improvements": len(improvements.data),
-        "top_errors": top_errors.data,
-        "learning_percentage": learning,
-        "report_text": report_text,
-        "created_at": datetime.utcnow().isoformat()
+    mutations = db.table("mutations").select("score", "source", "timestamp", "veto_reason").order("timestamp", desc=True).limit(10).execute()
+    return {
+        "lung_successes": state.get("lung_successes", 0),
+        "heart_successes": state.get("heart_successes", 0),
+        "rejections": state.get("rejections", 0),
+        "approved_layers_count": state.get("approved_layers_count", 0),
+        "pending_layers_count": len(state.get("pending_layers", [])),
+        "last_10_mutations": mutations.data if mutations.data else [],
+        "threshold": get_config_int("ombudsman_threshold", 85),
+        "workers": APPROVAL_WORKERS_COUNT,
+        "auto_approve_threshold": AUTO_APPROVE_THRESHOLD
+    }
+
+@app.post("/api/admin/set_threshold/{new_threshold}")
+async def set_threshold(new_threshold: int):
+    new_threshold = max(0, min(100, new_threshold))
+    db.table("system_config").upsert({
+        "key": "ombudsman_threshold",
+        "value": str(new_threshold),
+        "updated_at": datetime.utcnow().isoformat()
     }).execute()
-    total_agents = 200
-    for i in range(1, total_agents+1):
-        db.table("agent_messages").insert({
-            "layer_id": None,
-            "agent_id": str(i),
-            "message": report_text,
-            "round": 0,
-            "sent_at": datetime.utcnow().isoformat()
-        }).execute()
-    logger.info(f"EOD report generated for {today}")
+    await write_audit_log("THRESHOLD_CHANGE", f"Set to {new_threshold}", "admin")
+    return {"new_threshold": new_threshold}
 
-async def schedule_eod():
-    while True:
-        now = datetime.utcnow()
-        next_run = datetime(now.year, now.month, now.day, 23, 59, 0)
-        if now >= next_run:
-            next_run += timedelta(days=1)
-        await asyncio.sleep((next_run - now).total_seconds())
-        await generate_eod_report()
+@app.post("/api/admin/force_mutation")
+async def force_mutation():
+    threshold = get_config_int("ombudsman_threshold", 85)
+    models = ["deepseek", "mistral", "groq", "gemini", "cerebras"]
+    domains = ["Medical Innovation", "Longevity Science", "Regulatory Compliance", "Venture Architecture"]
+    domain = random.choice(domains)
+    model = random.choice(models)
+    content = f"Forced test mutation for {domain} – increase efficiency by 25% using {model}."
+    oScore = random.randint(60, 95)
+    agent = "999"
+    state = get_state()
+    if oScore >= threshold:
+        state["lung_successes"] += 1
+        log = f"✅ [FORCED] {model} accepted (Score: {oScore}) - {domain}"
+        veto_reason = None
+    else:
+        state["rejections"] += 1
+        log = f"⛔ [FORCED] {model} rejected (Score: {oScore} < {threshold}) - {domain}"
+        veto_reason = f"Score {oScore} below threshold"
+    db.table("mutations").insert({
+        "content": content,
+        "score": oScore,
+        "source": model,
+        "timestamp": datetime.utcnow().isoformat(),
+        "domain": domain,
+        "agent": agent,
+        "veto_reason": veto_reason
+    }).execute()
+    state["logs"].insert(0, log)
+    if len(state["logs"]) > 30:
+        state["logs"] = state["logs"][:30]
+    save_state(state)
+    return {"status": "done", "accepted": oScore >= threshold, "score": oScore, "threshold": threshold}
 
-# ---------- Admin Endpoints ----------
+@app.post("/api/admin/reset_counters")
+async def reset_counters():
+    state = get_state()
+    state["heart_successes"] = 0
+    state["lung_successes"] = 0
+    state["rejections"] = 0
+    state["uses"] = 0
+    state["daily_learning"] = 0
+    state["baseline_anchor"] = 1000000
+    state["approved_layers_count"] = 0
+    save_state(state)
+    await write_audit_log("ADMIN_RESET", "Counters reset", "admin")
+    return {"status": "reset"}
+
 @app.post("/api/admin/cleanup_pending_layers")
 async def admin_cleanup_pending_layers():
-    """Remove invalid pending layer entries and create a safe anchor if empty."""
     state = get_state()
     old_pending = state.get("pending_layers", [])
     valid_pending = []
     removed = []
-
     for layer in old_pending:
         layer_id = layer.get("id")
         if not layer_id:
@@ -637,10 +642,8 @@ async def admin_cleanup_pending_layers():
                 removed.append(layer)
         except Exception:
             removed.append(layer)
-
     state["pending_layers"] = valid_pending
     save_state(state)
-
     if not valid_pending:
         result = db.table("layer_proposals").insert({
             "name": "Safe Anchor Layer",
@@ -650,15 +653,10 @@ async def admin_cleanup_pending_layers():
             "created_at": datetime.utcnow().isoformat()
         }).execute()
         new_id = result.data[0]["id"]
-        state["pending_layers"].append({"id": new_id, "name": "Safe Anchor Layer", "description": "Auto‑created after cleanup to ensure system continuity."})
+        state["pending_layers"].append({"id": new_id, "name": "Safe Anchor Layer", "description": "Auto‑created after cleanup."})
         save_state(state)
-
-    await write_audit_log("ADMIN_CLEANUP", f"Removed {len(removed)} invalid entries. Kept {len(valid_pending)}.", "admin")
-    return {
-        "removed_count": len(removed),
-        "kept_count": len(valid_pending),
-        "removed_examples": [l.get("id") for l in removed[:10]]
-    }
+    await write_audit_log("ADMIN_CLEANUP", f"Removed {len(removed)} invalid entries.", "admin")
+    return {"removed_count": len(removed), "kept_count": len(valid_pending), "removed_examples": [l.get("id") for l in removed[:10]]}
 
 @app.get("/api/admin/queue_status")
 async def queue_status():
@@ -673,23 +671,7 @@ async def queue_status():
         "workers": APPROVAL_WORKERS_COUNT
     }
 
-# ---------- Debug Endpoint (optional) ----------
-@app.post("/api/debug/create_layer")
-async def debug_create_layer():
-    result = db.table("layer_proposals").insert({
-        "name": "Debug Test Layer",
-        "description": "Created via debug endpoint for testing auto-approval.",
-        "status": "pending",
-        "type": "debug",
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
-    layer_id = result.data[0]["id"]
-    state = get_state()
-    state["pending_layers"].append({"id": layer_id, "name": "Debug Test Layer", "description": "Created via debug endpoint for testing auto-approval."})
-    save_state(state)
-    return {"status": "layer_created", "layer_id": layer_id}
-
-# ---------- Public API Endpoints ----------
+# ---------- Public Status Endpoints ----------
 @app.get("/api/status")
 async def get_status():
     state = get_state()
@@ -746,16 +728,53 @@ async def check_mandatory_cycles():
     return {"status": "ok", "missed_filled": expected - last_proposal}
 
 # ---------- Startup ----------
+async def generate_eod_report():
+    now = datetime.utcnow()
+    today = now.date()
+    approved_today = db.table("layer_proposals").select("id").eq("status","approved").gte("approved_at", f"{today}T00:00:00Z").execute()
+    total_approved = len(approved_today.data)
+    improvements = db.table("layer_proposals").select("id").eq("type","error_prevention").gte("approved_at", f"{today}T00:00:00Z").execute()
+    state = get_state()
+    learning = state.get("daily_learning", 0)
+    top_errors = db.table("error_analysis").select("error_pattern","frequency").order("created_at", desc=True).limit(3).execute()
+    report_text = f"EOD Report {today}\nTotal layers approved today: {total_approved}\nImprovements: {len(improvements.data)}\nTop errors: {top_errors.data if top_errors.data else 'none'}\nLearning: {learning:.2f}%"
+    db.table("eod_reports").insert({
+        "report_date": today.isoformat(),
+        "total_layers_approved": total_approved,
+        "improvements": len(improvements.data),
+        "top_errors": top_errors.data,
+        "learning_percentage": learning,
+        "report_text": report_text,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    for i in range(1, 201):
+        db.table("agent_messages").insert({
+            "layer_id": None,
+            "agent_id": str(i),
+            "message": report_text,
+            "round": 0,
+            "sent_at": datetime.utcnow().isoformat()
+        }).execute()
+    logger.info(f"EOD report generated for {today}")
+
+async def schedule_eod():
+    while True:
+        now = datetime.utcnow()
+        next_run = datetime(now.year, now.month, now.day, 23, 59, 0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        await generate_eod_report()
+
 @app.on_event("startup")
 async def startup():
     await ensure_initial_layer()
     asyncio.create_task(heart_worker())
     asyncio.create_task(lung_worker())
-    # Start 15 parallel approval workers
     for i in range(APPROVAL_WORKERS_COUNT):
         asyncio.create_task(approval_worker(i))
     asyncio.create_task(schedule_eod())
-    logger.info(f"LROS Sovereign Engine started – threshold={AUTO_APPROVE_THRESHOLD}, workers={APPROVAL_WORKERS_COUNT}")
+    logger.info(f"LROS started – threshold={AUTO_APPROVE_THRESHOLD}, workers={APPROVAL_WORKERS_COUNT}")
 
 if __name__ == "__main__":
     import uvicorn
