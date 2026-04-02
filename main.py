@@ -1,5 +1,6 @@
 # ============================================================================
-# LROS – Heart & Lung Engine with Mutations Table
+# LROS – Complete Integrated Backend
+# Heart (tactical), Lung (evolution), Governance, Ingestion, Supabase Persistence
 # ============================================================================
 
 import os
@@ -7,15 +8,16 @@ import asyncio
 import random
 import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
+from typing import Optional, List
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("LROS-Engine")
+logger = logging.getLogger("LROS-Integrated")
 
-app = FastAPI(title="LROS Heart & Lung Engine")
+app = FastAPI(title="LROS Integrated Engine")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ---------- Supabase ----------
@@ -25,23 +27,29 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise Exception("Missing SUPABASE_URL or SUPABASE_KEY environment variables")
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- Ensure Mutations Table Exists ----------
-def ensure_mutations_table():
+# ---------- Ensure Tables Exist ----------
+def ensure_tables():
+    # sovereign_state (single row id=1)
     try:
-        # Check if table exists by trying to select 1 row
-        db.table("mutations").select("*").limit(1).execute()
-    except Exception:
-        # Create table using raw SQL (Supabase client doesn't support DDL directly, so we use REST)
-        # We'll use the `execute` method with raw SQL (requires service_role key, but we have anon)
-        # Alternative: create table manually in Supabase dashboard. For simplicity, we'll print instruction.
-        logger.error("Mutations table does not exist. Please create it in Supabase with columns: id (int8, primary key, auto increment), content (text), score (int4), source (text), timestamp (timestamptz), domain (text), agent (text), veto_reason (text).")
-        # We'll continue without crashing; the app will try to insert and fail gracefully.
-ensure_mutations_table()
+        db.table("sovereign_state").select("id").limit(1).execute()
+    except:
+        db.table("sovereign_state").insert({"id": 1, "state_data": {}}).execute()
+    # mutations table
+    try:
+        db.table("mutations").select("id").limit(1).execute()
+    except:
+        logger.warning("Mutations table not found. Please create it manually with columns: id, content, score, source, timestamp, domain, agent, veto_reason.")
+    # layer_proposals table
+    try:
+        db.table("layer_proposals").select("id").limit(1).execute()
+    except:
+        logger.warning("Layer_proposals table not found. Please create manually: id, name, description, status, created_at.")
+ensure_tables()
 
 # ---------- State Management ----------
 def get_state():
     res = db.table("sovereign_state").select("state_data").eq("id", 1).execute()
-    if not res.data:
+    if not res.data or not res.data[0].get("state_data"):
         default = {
             "baseline_anchor": 1008922,
             "heart_successes": 1027965,
@@ -51,19 +59,22 @@ def get_state():
             "daily_learning": 2921731.39,
             "active_agent": "244",
             "mutation_ledger": [],
-            "logs": ["[SYSTEM] LROS Heart & Lung Engine Online"]
+            "logs": [],
+            "pending_layers": [],
+            "approved_layers_count": 0,
+            "knowledge_vault": []
         }
-        db.table("sovereign_state").insert({"id": 1, "state_data": default}).execute()
+        db.table("sovereign_state").update({"state_data": default}).eq("id", 1).execute()
         return default
     return res.data[0]["state_data"]
 
 def save_state(state):
     db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
 
-# ---------- Helper to insert a mutation ----------
+# ---------- Helper: Insert Mutation ----------
 def insert_mutation(content, score, source, domain, agent, veto_reason=None):
     try:
-        data = {
+        db.table("mutations").insert({
             "content": content,
             "score": score,
             "source": source,
@@ -71,12 +82,23 @@ def insert_mutation(content, score, source, domain, agent, veto_reason=None):
             "domain": domain,
             "agent": agent,
             "veto_reason": veto_reason
-        }
-        db.table("mutations").insert(data).execute()
+        }).execute()
     except Exception as e:
         logger.error(f"Failed to insert mutation: {e}")
 
-# ---------- Background Tasks ----------
+# ---------- Helper: Insert Layer Proposal ----------
+def insert_layer_proposal(name, description):
+    try:
+        db.table("layer_proposals").insert({
+            "name": name,
+            "description": description,
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+    except Exception as e:
+        logger.error(f"Failed to insert layer proposal: {e}")
+
+# ---------- Background Workers ----------
 async def heart_worker():
     while True:
         try:
@@ -107,7 +129,7 @@ async def heart_worker():
         await asyncio.sleep(0.5)
 
 async def lung_worker():
-    threshold = 85
+    threshold = 85  # can be made configurable via state
     auto_lab = False
     models = ["deepseek", "mistral", "groq", "gemini", "cerebras"]
     domains = ["Medical Innovation", "Longevity Science", "Regulatory Compliance", "Venture Architecture"]
@@ -118,7 +140,6 @@ async def lung_worker():
             oScore = random.randint(50, 100)
             domain = random.choice(domains)
             agent = str(random.randint(1, 500)).zfill(3)
-            # Generate a plausible mutation content
             content = f"Optimization strategy for {domain}: Increase efficiency by {random.randint(5,30)}% using {model} model."
 
             if oScore >= threshold:
@@ -142,14 +163,17 @@ async def lung_worker():
                 veto_reason = f"Ombudsman score {oScore} below threshold {threshold}"
 
             # Insert mutation record
-            insert_mutation(
-                content=content,
-                score=oScore,
-                source=model,
-                domain=domain,
-                agent=agent,
-                veto_reason=veto_reason
-            )
+            insert_mutation(content, oScore, model, domain, agent, veto_reason)
+
+            # Occasionally propose a new layer (if high score)
+            if oScore >= 92 and random.random() > 0.85:
+                layer_names = ["Quantum Encryption Substrate", "Neural Routing Bypass", "Cognitive Empathy Engine", "Recursive Strategy Matrix", "Dynamic Resource Allocator"]
+                layer_name = random.choice(layer_names)
+                layer_desc = f"Architectural breakthrough generated by Swarm from {model} mutation."
+                insert_layer_proposal(layer_name, layer_desc)
+                # Also add to state's pending_layers for immediate frontend display
+                state["pending_layers"].append({"name": layer_name, "description": layer_desc, "id": f"lyr_{len(state['pending_layers'])}"})
+                log += f" | Proposed new layer: {layer_name}"
 
             state["logs"].insert(0, log)
             if len(state["logs"]) > 30:
@@ -182,6 +206,60 @@ async def secure_baseline():
     save_state(state)
     return {"status": "success", "new_baseline": total}
 
+@app.post("/api/ingest")
+async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optional[str] = Form(None), text: Optional[str] = Form(None)):
+    state = get_state()
+    mass_gain = 5000
+    uses_gain = 25000
+    learning_gain = 500.5
+    if file:
+        content = await file.read()
+        source = f"File: {file.filename}"
+        state["knowledge_vault"].append({"type": "file", "name": file.filename, "timestamp": datetime.utcnow().isoformat()})
+    elif url:
+        source = f"URL: {url}"
+        state["knowledge_vault"].append({"type": "url", "url": url, "timestamp": datetime.utcnow().isoformat()})
+    elif text:
+        source = "Raw text"
+        state["knowledge_vault"].append({"type": "text", "preview": text[:100], "timestamp": datetime.utcnow().isoformat()})
+    else:
+        raise HTTPException(400, "No file, URL, or text provided")
+    state["heart_successes"] += mass_gain
+    state["uses"] += uses_gain
+    state["daily_learning"] += learning_gain
+    state["logs"].insert(0, f"[VAULT] Ingested {source}. +{mass_gain} heart successes.")
+    save_state(state)
+    return {"status": "ingested", "mass_gain": mass_gain}
+
+@app.get("/api/layers/pending")
+async def get_pending_layers():
+    state = get_state()
+    return state.get("pending_layers", [])
+
+@app.post("/api/layers/approve")
+async def approve_layer(layer_id: str):
+    state = get_state()
+    layer = next((l for l in state["pending_layers"] if l["id"] == layer_id), None)
+    if not layer:
+        raise HTTPException(404, "Layer not found")
+    state["pending_layers"] = [l for l in state["pending_layers"] if l["id"] != layer_id]
+    state["approved_layers_count"] = state.get("approved_layers_count", 0) + 1
+    state["baseline_anchor"] += 50000  # Add mass to baseline
+    state["logs"].insert(0, f"[GOV] Approved layer: {layer['name']}. +50,000 to baseline.")
+    save_state(state)
+    return {"status": "approved"}
+
+@app.post("/api/layers/reject")
+async def reject_layer(layer_id: str):
+    state = get_state()
+    layer = next((l for l in state["pending_layers"] if l["id"] == layer_id), None)
+    if not layer:
+        raise HTTPException(404, "Layer not found")
+    state["pending_layers"] = [l for l in state["pending_layers"] if l["id"] != layer_id]
+    state["logs"].insert(0, f"[GOV] Rejected layer: {layer['name']}.")
+    save_state(state)
+    return {"status": "rejected"}
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "bond": "HOLDS"}
@@ -191,7 +269,7 @@ async def health():
 async def startup():
     asyncio.create_task(heart_worker())
     asyncio.create_task(lung_worker())
-    logger.info("LROS Heart & Lung engines started.")
+    logger.info("LROS Integrated Engine started.")
 
 if __name__ == "__main__":
     import uvicorn
