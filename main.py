@@ -8,7 +8,7 @@ import random
 import logging
 import re
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -62,6 +62,23 @@ def get_state():
 
 def save_state(state):
     db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
+
+# ---------- Ensure at least one pending layer on startup ----------
+async def ensure_initial_layer():
+    state = get_state()
+    if not state.get("pending_layers"):
+        # Create a default anchor layer
+        result = db.table("layer_proposals").insert({
+            "name": "Genesis Anchor Layer",
+            "description": "Initial stability layer. Establishes baseline governance.",
+            "status": "pending",
+            "type": "system",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        layer_id = result.data[0]["id"]
+        state["pending_layers"].append({"id": layer_id, "name": "Genesis Anchor Layer", "description": "Initial stability layer. Establishes baseline governance."})
+        save_state(state)
+        await write_audit_log("SYSTEM_LAYER", "Created initial anchor layer", "system")
 
 # ---------- AI Caller (DeepSeek + Gemini fallback) ----------
 DEEPSEEK_API_KEYS = [k.strip() for k in os.environ.get("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
@@ -118,7 +135,7 @@ def inc_config(key):
 def set_config(key, val):
     db.table("system_config").upsert({"key": key, "value": str(val)}).execute()
 
-# ---------- Mandatory Layer Generator (now stores real UUID) ----------
+# ---------- Mandatory Layer Generator (stores real UUID) ----------
 def create_fallback_layer(reason: str, layer_type: str = "auto_enforced"):
     name = f"Cycle‑enforced improvement ({reason})"
     description = "Automatically generated to comply with mandatory layer rule. Adjusts system for better stability."
@@ -165,27 +182,33 @@ async def heart_worker():
             logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Lung Worker with mandatory cycle, pattern library, refinement, and auto-approval ----------
+# ---------- Lung Worker with mandatory cycle, pattern library, refinement, and auto-approve ----------
 AUTO_APPROVE_THRESHOLD = 20   # auto‑approve when pending layers count reaches this
 
 async def auto_approve_pending_layers():
-    """Automatically approve pending layers when count >= threshold."""
+    """Automatically approve all pending layers when count >= threshold, with bulk logging."""
     state = get_state()
     pending = state.get("pending_layers", [])
     if len(pending) >= AUTO_APPROVE_THRESHOLD:
-        # Approve all pending layers (oldest first)
+        # Collect descriptions for backtracking log
+        approved_ids = []
+        approved_names = []
         for layer in pending:
             layer_id = layer.get("id")
             if not layer_id:
                 continue
             try:
                 await approve_layer_by_id(layer_id, auto=True)
+                approved_ids.append(layer_id)
+                approved_names.append(layer.get("name", "unknown"))
             except Exception as e:
                 logger.error(f"Auto-approve failed for {layer_id}: {e}")
-        # Refresh state after approvals
+        # Refresh state and add bulk log entry
         state = get_state()
-        state["logs"].insert(0, f"[AUTO] Approved {len(pending)} layers (threshold {AUTO_APPROVE_THRESHOLD}).")
+        summary = f"[BULK AUTO] Approved {len(approved_ids)} layers. IDs: {', '.join(approved_ids[:5])}{'...' if len(approved_ids)>5 else ''}. Names: {', '.join(approved_names[:3])}{'...' if len(approved_names)>3 else ''}."
+        state["logs"].insert(0, summary)
         save_state(state)
+        await write_audit_log("BULK_AUTO_APPROVE", summary, "system")
 
 async def approve_layer_by_id(layer_id: str, auto: bool = False):
     """Core approval logic (shared between endpoint and auto-approve)."""
@@ -221,6 +244,12 @@ async def approve_layer_by_id(layer_id: str, auto: bool = False):
     state["pending_layers"] = [p for p in state.get("pending_layers", []) if p.get("id") != layer_id]
     state["logs"].insert(0, f"[GOV] {'Auto-approved' if auto else 'Approved'} layer: {layer['name']}. +50,000 baseline. Learning +{learning_increment}%.")
     save_state(state)
+
+    # Report every 1000 layers
+    if state["approved_layers_count"] % 1000 == 0:
+        state["logs"].insert(0, f"[MILESTONE] {state['approved_layers_count']} layers approved. System resilience increased.")
+        save_state(state)
+        await write_audit_log("LAYER_MILESTONE", f"{state['approved_layers_count']} layers approved", "system")
 
     # Quorum discussion (simulated)
     total_agents = 200
@@ -269,7 +298,7 @@ async def lung_worker():
                     create_fallback_layer(f"Mutation cycle {missing*5}", "mutation_mandatory")
                 set_config("last_proposal_cycle", expected)
 
-            # 2. Auto‑approve pending layers if threshold reached
+            # 2. Auto‑approve pending layers if threshold reached (bulk)
             await auto_approve_pending_layers()
 
             # 3. Fetch context for mutation
@@ -552,7 +581,8 @@ async def generate_eod_report():
 async def schedule_eod():
     while True:
         now = datetime.utcnow()
-        next_run = datetime(now.year, now.month, now.day, 23, 59, 0, tzinfo=timezone.utc)
+        # Naive UTC: next run at 23:59:00 UTC today or tomorrow
+        next_run = datetime(now.year, now.month, now.day, 23, 59, 0)
         if now >= next_run:
             next_run += timedelta(days=1)
         await asyncio.sleep((next_run - now).total_seconds())
@@ -617,6 +647,7 @@ async def check_mandatory_cycles():
 # ---------- Startup ----------
 @app.on_event("startup")
 async def startup():
+    await ensure_initial_layer()   # Do a layer
     asyncio.create_task(heart_worker())
     asyncio.create_task(lung_worker())
     asyncio.create_task(schedule_eod())
