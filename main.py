@@ -392,7 +392,6 @@ async def audit_proposal(proposal):
     return _fallback_audit(proposal)
 
 # ---------- Simulation Module (from simulation.py) ----------
-# We'll import at runtime to avoid circular imports
 _simulation_module = None
 def get_simulation():
     global _simulation_module
@@ -410,7 +409,6 @@ async def propose_new_agent(state):
     """Use an LLM to generate a new agent type based on recent successes."""
     if not META_EVOLVE:
         return
-    # We need a model to generate the proposal; reuse the first available model
     if not MODELS:
         return
     model = MODELS[0]
@@ -419,7 +417,6 @@ async def propose_new_agent(state):
         logger.warning("No healthy key for meta‑evolution")
         return
 
-    # Build prompt with recent mutation examples
     recent_mutations = state.get("mutation_ledger", [])[-5:]
     prompt = f"""
 Based on the current evolution state: {recent_mutations}, propose a new specialized AI agent that could accelerate our progress in {state.get('current_domain', 'medical innovation')}.
@@ -442,12 +439,10 @@ Output a JSON with:
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
-            # Parse JSON
             import re
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 proposal = json.loads(json_match.group())
-                # Store in governance table (requires a new table `agent_proposals`)
                 if supabase:
                     supabase.table("agent_proposals").insert({
                         "name": proposal.get("name"),
@@ -467,7 +462,6 @@ async def run_real_lab_experiment(protocol: str) -> Optional[float]:
     For now, just log and return a random score to simulate.
     """
     logger.info(f"[LAB] Would run experiment: {protocol[:100]}...")
-    # In future: replace with actual API call
     return random.uniform(0.6, 0.95)
 
 # ---------- Supabase client ----------
@@ -475,7 +469,8 @@ supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def store_mutation(proposal, audit):
+# ---------- store_mutation (now async) ----------
+async def store_mutation(proposal, audit):
     if not supabase:
         return
     if audit["accepted"]:
@@ -495,7 +490,6 @@ def store_mutation(proposal, audit):
             if sim:
                 sim_score = sim.run_simulation(proposal["content"], SIMULATION_TYPE)
                 if sim_score is not None:
-                    # Store simulation result
                     supabase.table("simulation_results").insert({
                         "mutation_source": proposal["source"],
                         "mutation_content_preview": proposal["content"][:200],
@@ -519,19 +513,7 @@ def store_mutation(proposal, audit):
                 }).execute()
                 logger.info(f"Real experiment for {proposal['source']} scored {real_score:.3f}")
 
-        # --- META-EVOLUTION ---
-        # Keep a counter of accepted mutations (can be stored in state)
-        # For simplicity, we'll just call periodically based on a global counter.
-        # We'll increment a file‑based counter or use a database value.
-        # Here we'll use a simple memory counter that resets on restart – not ideal.
-        # A better approach: store a `accepted_count` in Supabase and query.
-        # For now, we'll call it every `META_EVOLVE_FREQ` accepted mutations.
-        # We'll need to store a counter in the database.
-        # Let's implement a simple atomic increment.
-        # This is a placeholder – you can implement a proper counter.
-        # We'll skip meta‑evolution in this version for simplicity.
-        pass
-
+        # (Meta‑evolution can be triggered here, but we'll keep it simple for now)
     else:
         supabase.table("vetoes").insert({
             "source": proposal["source"],
@@ -566,7 +548,7 @@ async def worker(agent, sem):
             proposal = await generate_proposal(agent)
             async with sem:
                 audit = await audit_proposal(proposal)
-            store_mutation(proposal, audit)
+            await store_mutation(proposal, audit)   # now await
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.exception(f"Worker {agent['id']} error")
