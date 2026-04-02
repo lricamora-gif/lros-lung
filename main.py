@@ -1,5 +1,5 @@
 # ============================================================================
-# LROS – Complete Integrated Backend (Projects 1,2,3 + Pattern Library)
+# LROS – Complete Integrated Backend (Projects 1,2,3 + Pattern Library + /api/mutations)
 # ============================================================================
 
 import os
@@ -540,6 +540,11 @@ async def get_status():
         "mutation_ledger": state.get("mutation_ledger", []),
         "logs": state.get("logs", [])
     }
+
+@app.get("/api/mutations")
+async def get_mutations():
+    res = db.table("mutations").select("*").order("timestamp", desc=True).limit(20).execute()
+    return res.data
 
 @app.get("/api/engine1/stats")
 async def get_engine1_stats():
