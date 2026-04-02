@@ -23,7 +23,6 @@ def run_cell_viability_simulation(mutation_text: str) -> float:
 
 def run_agi_benchmark_simulation(mutation_text: str) -> float:
     """Simulate an AGI benchmark run."""
-    # Placeholder – replace with actual benchmark calls
     return random.uniform(0.4, 0.95)
 
 def run_asi_sandbox_simulation(mutation_text: str) -> float:
