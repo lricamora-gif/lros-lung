@@ -118,7 +118,7 @@ def inc_config(key):
 def set_config(key, val):
     db.table("system_config").upsert({"key": key, "value": str(val)}).execute()
 
-# ---------- Mandatory Layer Generator (with correct UUID) ----------
+# ---------- Mandatory Layer Generator (now stores real UUID) ----------
 def create_fallback_layer(reason: str, layer_type: str = "auto_enforced"):
     name = f"Cycle‑enforced improvement ({reason})"
     description = "Automatically generated to comply with mandatory layer rule. Adjusts system for better stability."
@@ -326,7 +326,7 @@ async def lung_worker():
                 state["rejections"] += 1
                 log = f"⛔ [VETO] {model} rejected (Score: {oScore} < {threshold}) - {domain}"
                 veto_reason = f"Score {oScore} below threshold {threshold}"
-                # Attempt refinement
+                # Attempt refinement using pattern library
                 patterns_ref = db.table("pattern_library").select("content").order("uses", desc=True).limit(2).execute()
                 if patterns_ref.data:
                     refine_prompt = f"Original vetoed mutation: {content}\nSuccessful pattern: {patterns_ref.data[0]['content']}\nEdit the original to make it more like the successful pattern, keeping domain {domain}. Output only the edited mutation."
