@@ -118,19 +118,20 @@ def inc_config(key):
 def set_config(key, val):
     db.table("system_config").upsert({"key": key, "value": str(val)}).execute()
 
-# ---------- Mandatory Layer Generator (no LLM) ----------
+# ---------- Mandatory Layer Generator (with correct UUID) ----------
 def create_fallback_layer(reason: str, layer_type: str = "auto_enforced"):
     name = f"Cycle‑enforced improvement ({reason})"
     description = "Automatically generated to comply with mandatory layer rule. Adjusts system for better stability."
-    db.table("layer_proposals").insert({
+    result = db.table("layer_proposals").insert({
         "name": name,
         "description": description,
         "status": "pending",
         "type": layer_type,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
+    layer_id = result.data[0]["id"]   # actual Supabase UUID
     state = get_state()
-    state["pending_layers"].append({"id": f"auto_{len(state['pending_layers'])}", "name": name, "description": description})
+    state["pending_layers"].append({"id": layer_id, "name": name, "description": description})
     save_state(state)
     asyncio.create_task(write_audit_log("MANDATORY_PROPOSAL_CREATED", f"Fallback layer for {reason}", "system"))
 
@@ -164,7 +165,94 @@ async def heart_worker():
             logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Lung Worker with mandatory cycle, pattern library, refinement ----------
+# ---------- Lung Worker with mandatory cycle, pattern library, refinement, and auto-approval ----------
+AUTO_APPROVE_THRESHOLD = 20   # auto‑approve when pending layers count reaches this
+
+async def auto_approve_pending_layers():
+    """Automatically approve pending layers when count >= threshold."""
+    state = get_state()
+    pending = state.get("pending_layers", [])
+    if len(pending) >= AUTO_APPROVE_THRESHOLD:
+        # Approve all pending layers (oldest first)
+        for layer in pending:
+            layer_id = layer.get("id")
+            if not layer_id:
+                continue
+            try:
+                await approve_layer_by_id(layer_id, auto=True)
+            except Exception as e:
+                logger.error(f"Auto-approve failed for {layer_id}: {e}")
+        # Refresh state after approvals
+        state = get_state()
+        state["logs"].insert(0, f"[AUTO] Approved {len(pending)} layers (threshold {AUTO_APPROVE_THRESHOLD}).")
+        save_state(state)
+
+async def approve_layer_by_id(layer_id: str, auto: bool = False):
+    """Core approval logic (shared between endpoint and auto-approve)."""
+    res = db.table("layer_proposals").select("*").eq("id", layer_id).execute()
+    if not res.data:
+        raise HTTPException(404, "Layer not found")
+    layer = res.data[0]
+    db.table("layer_proposals").update({
+        "status": "approved",
+        "approved_at": datetime.utcnow().isoformat()
+    }).eq("id", layer_id).execute()
+
+    # Apply layer impact
+    name = layer["name"].lower()
+    desc = layer["description"].lower()
+    impact = "System performance improved."
+    if "threshold" in name or "threshold" in desc:
+        numbers = re.findall(r"\d+", desc + name)
+        if numbers:
+            new_threshold = int(numbers[0])
+            db.table("system_config").upsert({
+                "key": "ombudsman_threshold",
+                "value": str(new_threshold),
+                "updated_at": datetime.utcnow().isoformat()
+            }).execute()
+            impact = f"Ombudsman threshold adjusted to {new_threshold}%."
+
+    state = get_state()
+    learning_increment = 0.1
+    state["daily_learning"] = state.get("daily_learning", 0) + learning_increment
+    state["approved_layers_count"] = state.get("approved_layers_count", 0) + 1
+    state["baseline_anchor"] += 50000
+    state["pending_layers"] = [p for p in state.get("pending_layers", []) if p.get("id") != layer_id]
+    state["logs"].insert(0, f"[GOV] {'Auto-approved' if auto else 'Approved'} layer: {layer['name']}. +50,000 baseline. Learning +{learning_increment}%.")
+    save_state(state)
+
+    # Quorum discussion (simulated)
+    total_agents = 200
+    half = total_agents // 2
+    explanation = f"Layer '{layer['name']}' approved. {layer['description']}. Advantage: {impact}"
+    for i in range(1, half+1):
+        db.table("agent_messages").insert({
+            "layer_id": layer["id"],
+            "agent_id": str(i),
+            "message": explanation,
+            "round": 1,
+            "sent_at": datetime.utcnow().isoformat()
+        }).execute()
+    for i in range(half+1, total_agents+1):
+        db.table("agent_messages").insert({
+            "layer_id": layer["id"],
+            "agent_id": str(i),
+            "message": f"Agent {random.randint(1,half)} explained: {explanation}",
+            "round": 2,
+            "sent_at": datetime.utcnow().isoformat()
+        }).execute()
+
+    if state["approved_layers_count"] % 5 == 0:
+        state["logs"].insert(0, f"[KNOWLEDGE EXCHANGE] {state['approved_layers_count']} layers approved. Heart and Lung exchanged learnings.")
+        save_state(state)
+        asyncio.create_task(write_audit_log("KNOWLEDGE_EXCHANGE", f"Cycle {state['approved_layers_count']}", "system"))
+
+    if state["approved_layers_count"] % 100 == 0:
+        asyncio.create_task(run_retrospective_analysis(state["approved_layers_count"]))
+
+    asyncio.create_task(write_audit_log("LAYER_APPROVED", f"Layer '{layer['name']}' approved", "governance"))
+
 async def lung_worker():
     threshold_res = db.table("system_config").select("value").eq("key", "ombudsman_threshold").execute()
     threshold = int(threshold_res.data[0]["value"]) if threshold_res.data else 85
@@ -181,7 +269,10 @@ async def lung_worker():
                     create_fallback_layer(f"Mutation cycle {missing*5}", "mutation_mandatory")
                 set_config("last_proposal_cycle", expected)
 
-            # 2. Fetch context: approved layers, knowledge vault, pattern library
+            # 2. Auto‑approve pending layers if threshold reached
+            await auto_approve_pending_layers()
+
+            # 3. Fetch context for mutation
             approved_layers = db.table("layer_proposals").select("name","description").eq("status","approved").order("approved_at", desc=True).limit(5).execute()
             vault = db.table("knowledge_vault").select("content").limit(5).execute()
             patterns = db.table("pattern_library").select("content","domain").order("uses", desc=True).limit(3).execute()
@@ -195,13 +286,12 @@ async def lung_worker():
 
             domain = random.choice(domains)
             model = random.choice(models)
-            # Generate mutation with context
             prompt = f"Generate a novel mutation strategy in domain: {domain}. Use the following context to improve quality:\n{context}\nStrategy:"
             content = call_ai(prompt, temperature=0.8)
             if not content or content.startswith("[Simulated]"):
                 content = f"Optimization strategy for {domain}: Increase efficiency by {random.randint(5,30)}% using {model} model."
 
-            # 3. Ombudsman scoring
+            # 4. Ombudsman scoring
             score_prompt = f"Rate the following strategy from 0 to 100 (100 = perfect). Return only integer score.\nStrategy: {content}\nScore:"
             score_resp = call_ai(score_prompt, temperature=0.2)
             try:
@@ -236,25 +326,25 @@ async def lung_worker():
                 state["rejections"] += 1
                 log = f"⛔ [VETO] {model} rejected (Score: {oScore} < {threshold}) - {domain}"
                 veto_reason = f"Score {oScore} below threshold {threshold}"
-                # Attempt refinement using pattern library
+                # Attempt refinement
                 patterns_ref = db.table("pattern_library").select("content").order("uses", desc=True).limit(2).execute()
                 if patterns_ref.data:
                     refine_prompt = f"Original vetoed mutation: {content}\nSuccessful pattern: {patterns_ref.data[0]['content']}\nEdit the original to make it more like the successful pattern, keeping domain {domain}. Output only the edited mutation."
                     refined = call_ai(refine_prompt, temperature=0.7)
                     if refined and refined != content:
-                        db.table("layer_proposals").insert({
+                        result = db.table("layer_proposals").insert({
                             "name": "Refined mutation proposal",
                             "description": refined,
                             "status": "pending",
                             "type": "mutation_refinement",
                             "created_at": datetime.utcnow().isoformat()
                         }).execute()
+                        layer_id = result.data[0]["id"]
                         state = get_state()
-                        state["pending_layers"].append({"id": f"ref_{len(state['pending_layers'])}", "name": "Refined mutation", "description": refined})
+                        state["pending_layers"].append({"id": layer_id, "name": "Refined mutation", "description": refined})
                         save_state(state)
                         asyncio.create_task(write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation into new layer", "lung"))
 
-            # Insert mutation record
             db.table("mutations").insert({
                 "content": content,
                 "score": oScore,
@@ -296,7 +386,6 @@ async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optiona
             "created_at": datetime.utcnow().isoformat()
         }).execute()
 
-        # Mandatory layer enforcement for ingestion
         ingestion_cycle = inc_config("ingestion_cycle")
         last_proposal = get_config_int("last_proposal_cycle")
         expected = ingestion_cycle // 5
@@ -326,84 +415,23 @@ async def propose_layer(request: dict):
     layer_type = request.get("type", "user")
     if not name or not description:
         raise HTTPException(400, "Missing name or description")
-    db.table("layer_proposals").insert({
+    result = db.table("layer_proposals").insert({
         "name": name,
         "description": description,
         "status": "pending",
         "type": layer_type,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
+    layer_id = result.data[0]["id"]
     state = get_state()
-    state["pending_layers"].append({"id": f"prop_{len(state['pending_layers'])}", "name": name, "description": description})
+    state["pending_layers"].append({"id": layer_id, "name": name, "description": description})
     save_state(state)
     asyncio.create_task(write_audit_log("LAYER_PROPOSED", f"Layer '{name}' proposed", "frontend"))
     return {"status": "proposed"}
 
 @app.post("/api/layers/approve")
 async def approve_layer(layer_id: str):
-    res = db.table("layer_proposals").select("*").eq("id", layer_id).execute()
-    if not res.data:
-        raise HTTPException(404, "Layer not found")
-    layer = res.data[0]
-    db.table("layer_proposals").update({
-        "status": "approved",
-        "approved_at": datetime.utcnow().isoformat()
-    }).eq("id", layer_id).execute()
-
-    # Apply layer (example: adjust threshold)
-    name = layer["name"].lower()
-    desc = layer["description"].lower()
-    impact = "System performance improved."
-    if "threshold" in name or "threshold" in desc:
-        numbers = re.findall(r"\d+", desc + name)
-        if numbers:
-            new_threshold = int(numbers[0])
-            db.table("system_config").upsert({
-                "key": "ombudsman_threshold",
-                "value": str(new_threshold),
-                "updated_at": datetime.utcnow().isoformat()
-            }).execute()
-            impact = f"Ombudsman threshold adjusted to {new_threshold}%."
-
-    state = get_state()
-    learning_increment = 0.1
-    state["daily_learning"] = state.get("daily_learning", 0) + learning_increment
-    state["approved_layers_count"] = state.get("approved_layers_count", 0) + 1
-    state["baseline_anchor"] += 50000
-    state["pending_layers"] = [p for p in state.get("pending_layers", []) if p.get("id") != layer_id]
-    state["logs"].insert(0, f"[GOV] Approved layer: {layer['name']}. +50,000 baseline. Learning +{learning_increment}%.")
-    save_state(state)
-
-    # Quorum discussion (simulated)
-    total_agents = 200
-    half = total_agents // 2
-    explanation = f"Layer '{layer['name']}' approved. {layer['description']}. Advantage: {impact}"
-    for i in range(1, half+1):
-        db.table("agent_messages").insert({
-            "layer_id": layer["id"],
-            "agent_id": str(i),
-            "message": explanation,
-            "round": 1,
-            "sent_at": datetime.utcnow().isoformat()
-        }).execute()
-    for i in range(half+1, total_agents+1):
-        db.table("agent_messages").insert({
-            "layer_id": layer["id"],
-            "agent_id": str(i),
-            "message": f"Agent {random.randint(1,half)} explained: {explanation}",
-            "round": 2,
-            "sent_at": datetime.utcnow().isoformat()
-        }).execute()
-
-    if state["approved_layers_count"] % 5 == 0:
-        state["logs"].insert(0, f"[KNOWLEDGE EXCHANGE] {state['approved_layers_count']} layers approved. Heart and Lung exchanged learnings.")
-        save_state(state)
-        asyncio.create_task(write_audit_log("KNOWLEDGE_EXCHANGE", f"Cycle {state['approved_layers_count']}", "system"))
-
-    if state["approved_layers_count"] % 100 == 0:
-        asyncio.create_task(run_retrospective_analysis(state["approved_layers_count"]))
-
-    asyncio.create_task(write_audit_log("LAYER_APPROVED", f"Layer '{layer['name']}' approved", "governance"))
+    await approve_layer_by_id(layer_id, auto=False)
     return {"status": "approved"}
 
 @app.get("/api/layers/pending")
@@ -442,15 +470,16 @@ async def run_retrospective_analysis(cycle_number):
         response = call_ai(prompt, temperature=0.7)
         proposals = json.loads(response)
         for prop in proposals[:5]:
-            db.table("layer_proposals").insert({
+            result = db.table("layer_proposals").insert({
                 "name": prop["name"],
                 "description": prop["description"],
                 "status": "pending",
                 "type": "error_prevention",
                 "created_at": datetime.utcnow().isoformat()
             }).execute()
+            layer_id = result.data[0]["id"]
             state = get_state()
-            state["pending_layers"].append({"id": f"err_{len(state['pending_layers'])}", "name": prop["name"], "description": prop["description"]})
+            state["pending_layers"].append({"id": layer_id, "name": prop["name"], "description": prop["description"]})
             save_state(state)
     except Exception as e:
         logger.error(f"Retrospective analysis failed: {e}")
