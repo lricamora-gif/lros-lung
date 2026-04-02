@@ -1,5 +1,5 @@
 # ============================================================================
-# LROS – Complete Integrated Backend (Projects 1,2,3 + Pattern Library + /api/mutations)
+# LROS – Complete Integrated Backend (Projects 1,2,3 + Pattern Library + /api/state)
 # ============================================================================
 
 import os
@@ -545,6 +545,24 @@ async def get_status():
 async def get_mutations():
     res = db.table("mutations").select("*").order("timestamp", desc=True).limit(20).execute()
     return res.data
+
+@app.get("/api/state")
+async def get_full_state():
+    state = get_state()
+    return {
+        "baseline": state.get("baseline_anchor", 0),
+        "heart_successes": state.get("heart_successes", 0),
+        "lung_successes": state.get("lung_successes", 0),
+        "rejections": state.get("rejections", 0),
+        "uses": state.get("uses", 0),
+        "daily_learning": state.get("daily_learning", 0),
+        "active_agent": state.get("active_agent", "000"),
+        "approved_layers_count": state.get("approved_layers_count", 0),
+        "mutation_ledger": state.get("mutation_ledger", []),
+        "logs": state.get("logs", []),
+        "pending_layers": state.get("pending_layers", []),
+        "knowledge_vault": state.get("knowledge_vault", [])
+    }
 
 @app.get("/api/engine1/stats")
 async def get_engine1_stats():
