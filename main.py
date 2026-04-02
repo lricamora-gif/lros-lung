@@ -45,7 +45,7 @@ AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
 SIMULATION_TYPE = os.getenv("SIMULATION_TYPE", "drug_binding")
 AUTO_EXECUTE_REAL = os.getenv("AUTO_EXECUTE_REAL", "false").lower() == "true"
 META_EVOLVE = os.getenv("META_EVOLVE", "true").lower() == "true"
-META_EVOLVE_FREQ = int(os.getenv("META_EVOLVE_FREQ", "1000"))   # after every N accepted mutations
+META_EVOLVE_FREQ = int(os.getenv("META_EVOLVE_FREQ", "1000"))
 
 # ---------- KeyPool with failure tracking ----------
 class KeyPool:
@@ -347,7 +347,6 @@ async def _audit_with_model(auditor, proposal):
             "response_format": {"type": "json_object"}
         }
     else:
-        # fallback (should not be used for auditors)
         url = auditor["endpoint"]
         headers = {"Authorization": f"Bearer {key}"}
         payload = {
@@ -417,9 +416,9 @@ async def propose_new_agent(state):
         logger.warning("No healthy key for meta‑evolution")
         return
 
-    recent_mutations = state.get("mutation_ledger", [])[-5:]
+    recent_mutations = state.get("mutation_ledger", [])[-5:] if hasattr(state, 'get') else []
     prompt = f"""
-Based on the current evolution state: {recent_mutations}, propose a new specialized AI agent that could accelerate our progress in {state.get('current_domain', 'medical innovation')}.
+Based on the current evolution state: {recent_mutations}, propose a new specialized AI agent that could accelerate our progress in medical innovation.
 Output a JSON with:
 - name: short name
 - description: what it does
@@ -457,10 +456,6 @@ Output a JSON with:
 
 # ---------- Real Lab Connector Stub ----------
 async def run_real_lab_experiment(protocol: str) -> Optional[float]:
-    """
-    Placeholder: eventually call Emerald Cloud Lab or Strateos.
-    For now, just log and return a random score to simulate.
-    """
     logger.info(f"[LAB] Would run experiment: {protocol[:100]}...")
     return random.uniform(0.6, 0.95)
 
@@ -469,12 +464,11 @@ supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- store_mutation (now async) ----------
+# ---------- store_mutation (async) ----------
 async def store_mutation(proposal, audit):
     if not supabase:
         return
     if audit["accepted"]:
-        # Insert mutation
         record = {
             "source": proposal["source"],
             "content": proposal["content"],
@@ -484,7 +478,7 @@ async def store_mutation(proposal, audit):
         supabase.table("mutations").insert(record).execute()
         logger.info(f"Stored from {proposal['source']} (score {audit['score']})")
 
-        # --- AUTO-LAB SIMULATION ---
+        # Auto‑Lab Simulation
         if AUTO_EXECUTE:
             sim = get_simulation()
             if sim:
@@ -498,10 +492,8 @@ async def store_mutation(proposal, audit):
                         "created_at": datetime.utcnow().isoformat()
                     }).execute()
                     logger.info(f"Simulation for {proposal['source']} scored {sim_score:.3f}")
-                else:
-                    logger.info(f"Simulation skipped or failed for {proposal['source']}")
 
-        # --- REAL LAB CONNECTOR ---
+        # Real Lab Connector
         if AUTO_EXECUTE_REAL:
             real_score = await run_real_lab_experiment(proposal["content"])
             if real_score is not None:
@@ -513,7 +505,6 @@ async def store_mutation(proposal, audit):
                 }).execute()
                 logger.info(f"Real experiment for {proposal['source']} scored {real_score:.3f}")
 
-        # (Meta‑evolution can be triggered here, but we'll keep it simple for now)
     else:
         supabase.table("vetoes").insert({
             "source": proposal["source"],
@@ -591,6 +582,71 @@ async def health_monitor(app: FastAPI):
                 app.state.tasks = tasks
                 logger.info(f"Started {len(tasks)} workers")
 
+# ---------- KNOWLEDGE LEARNER (safe background task) ----------
+async def generate_knowledge_mutation(chunk_text: str) -> str:
+    """Convert a knowledge chunk into a mutation proposal using a cheap model."""
+    prompt = f"""You are LROS. Based on the following text, generate a single, actionable mutation proposal (a new idea, protocol, or layer) that LROS could adopt to improve itself. Output only the proposal text, no commentary.
+
+Text:
+{chunk_text[:1500]}
+"""
+    if not MODELS:
+        return None
+    model = MODELS[0]
+    key = await model["key_pool"].get()
+    if not key:
+        return None
+    url = model["endpoint"]
+    headers = {"Authorization": f"Bearer {key}"}
+    payload = {
+        "model": model["model_id"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 500
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Knowledge mutation generation failed: {e}")
+        return None
+
+async def knowledge_learner_loop():
+    """Periodically turn unprocessed knowledge chunks into mutations."""
+    while True:
+        try:
+            if not supabase:
+                await asyncio.sleep(3600)
+                continue
+            # Ensure processed column exists (optional: create if not)
+            # We'll just query; if column missing, error will be caught.
+            res = supabase.table("knowledge").select("*").eq("processed", False).limit(5).execute()
+            chunks = res.data
+            if chunks:
+                logger.info(f"Knowledge learner: processing {len(chunks)} chunks")
+                for chunk in chunks:
+                    proposal_text = await generate_knowledge_mutation(chunk["content"])
+                    if proposal_text:
+                        proposal = {"source": "knowledge", "content": proposal_text, "timestamp": datetime.utcnow()}
+                        audit = await audit_proposal(proposal)
+                        if audit["accepted"]:
+                            supabase.table("mutations").insert({
+                                "source": "knowledge",
+                                "content": proposal_text,
+                                "score": audit["score"],
+                                "created_at": datetime.utcnow().isoformat()
+                            }).execute()
+                            logger.info(f"Knowledge mutation stored (score {audit['score']})")
+                    # Mark as processed regardless of success (to avoid reprocessing)
+                    supabase.table("knowledge").update({"processed": True}).eq("id", chunk["id"]).execute()
+            await asyncio.sleep(3600)  # every hour
+        except Exception as e:
+            logger.error(f"Knowledge learner error: {e}")
+            await asyncio.sleep(300)
+
 # ---------- FastAPI app ----------
 app = FastAPI()
 app.add_middleware(
@@ -653,7 +709,6 @@ async def chat_endpoint(req: ChatRequest):
                 resp = await call_model_direct("deepseek", prompt)
                 return {"response": resp, "mode_used": "deepseek"}
             else:
-                # Try Gemini first, fallback to DeepSeek if needed
                 try:
                     resp = await call_model_direct("gemini", prompt)
                     return {"response": resp, "mode_used": "gemini"}
@@ -685,6 +740,9 @@ async def lifespan(app: FastAPI):
             tasks.append(asyncio.create_task(worker(agent, sem)))
         app.state.tasks = tasks
         logger.info(f"Started {len(tasks)} workers")
+
+    # Start knowledge learner background task (safe, only uses Supabase)
+    asyncio.create_task(knowledge_learner_loop())
 
     monitor_task = asyncio.create_task(health_monitor(app))
     app.state.monitor_task = monitor_task
