@@ -1,5 +1,7 @@
 # ============================================================================
-# LROS – Complete Integrated Backend (Projects 1,2,3) – STABLE VERSION
+# LROS – Complete Integrated Backend (Projects 1,2,3) – FULLY AUTOMATIC
+# Includes: Heart, Lung, Approval workers, auto mutation creation on approval,
+# unlimited mutations endpoint, health check, and all original features.
 # ============================================================================
 
 import os
@@ -8,6 +10,7 @@ import random
 import logging
 import re
 import json
+import uuid
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -199,7 +202,7 @@ async def heart_worker():
             logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Core Approval Logic (idempotent, fast for auto) ----------
+# ---------- Core Approval Logic (with automatic mutation creation) ----------
 async def approve_layer_by_id(layer_id: str, auto: bool = True):
     check = db.table("layer_proposals").select("status").eq("id", layer_id).execute()
     if not check.data:
@@ -232,13 +235,29 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
             }).execute()
             impact = f"Ombudsman threshold adjusted to {new_threshold}%."
 
+    # --- NEW: Automatically create a mutation from the approved layer ---
+    mutation_id = str(uuid.uuid4())
+    db.table("mutations").insert({
+        "id": mutation_id,
+        "source": "layer_proposal",
+        "content": f"{layer['name']}: {layer['description']}",
+        "score": 90,  # default high score for approved layers
+        "type": layer.get("type", "constitutional"),
+        "agent": "approval_worker",
+        "domain": "governance",
+        "veto_reason": None,
+        "timestamp": datetime.utcnow().isoformat(),
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    # --- End of auto mutation creation ---
+
     state = get_state()
     learning_increment = 0.1
     state["daily_learning"] = state.get("daily_learning", 0) + learning_increment
     state["approved_layers_count"] = state.get("approved_layers_count", 0) + 1
     state["baseline_anchor"] += 50000
     state["pending_layers"] = [p for p in state.get("pending_layers", []) if p.get("id") != layer_id]
-    state["logs"].insert(0, f"[GOV] {'Auto-approved' if auto else 'Approved'} layer: {layer['name']}. +50,000 baseline. Learning +{learning_increment}%.")
+    state["logs"].insert(0, f"[GOV] {'Auto-approved' if auto else 'Approved'} layer: {layer['name']}. +50,000 baseline. Learning +{learning_increment}%. Mutation created.")
     save_state(state)
 
     if state["approved_layers_count"] % 1000 == 0:
@@ -378,14 +397,17 @@ async def lung_worker():
                         save_state(state)
                         await write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation", "lung")
 
+            # Insert the new mutation (without name column)
             db.table("mutations").insert({
+                "id": str(uuid.uuid4()),
                 "content": content,
                 "score": oScore,
                 "source": model,
                 "timestamp": datetime.utcnow().isoformat(),
                 "domain": domain,
                 "agent": agent,
-                "veto_reason": veto_reason
+                "veto_reason": veto_reason,
+                "created_at": datetime.utcnow().isoformat()
             }).execute()
 
             state["logs"].insert(0, log)
@@ -645,9 +667,10 @@ async def get_status():
         "logs": state.get("logs", [])
     }
 
+# ---------- MODIFIED: Return ALL mutations (no limit) ----------
 @app.get("/api/mutations")
 async def get_mutations():
-    res = db.table("mutations").select("*").order("timestamp", desc=True).limit(20).execute()
+    res = db.table("mutations").select("*").order("timestamp", desc=True).execute()
     return res.data
 
 @app.get("/api/state")
@@ -673,6 +696,7 @@ async def get_engine1_stats():
     state = get_state()
     return {"total_successes": state.get("heart_successes", 0), "last_thought": ""}
 
+# ---------- Health endpoint (already present) ----------
 @app.get("/health")
 async def health():
     return {"status": "ok", "bond": "HOLDS"}
