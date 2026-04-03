@@ -1,7 +1,7 @@
 # ============================================================================
-# LROS – Complete Integrated Backend (Projects 1,2,3) – FULLY AUTOMATIC
-# Includes: Heart, Lung, Approval workers, auto mutation creation on approval,
-# unlimited mutations endpoint, health check, and all original features.
+# LROS – Complete Integrated Backend (Projects 1,2,3) – PRODUCTION READY
+# Includes: Heart, Lung, approval workers, auto mutation creation on approval,
+# optimized mutation feed (latest 100) + count endpoint, health check.
 # ============================================================================
 
 import os
@@ -235,13 +235,13 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
             }).execute()
             impact = f"Ombudsman threshold adjusted to {new_threshold}%."
 
-    # --- NEW: Automatically create a mutation from the approved layer ---
+    # --- Automatic mutation creation from approved layer ---
     mutation_id = str(uuid.uuid4())
     db.table("mutations").insert({
         "id": mutation_id,
         "source": "layer_proposal",
         "content": f"{layer['name']}: {layer['description']}",
-        "score": 90,  # default high score for approved layers
+        "score": 90,
         "type": layer.get("type", "constitutional"),
         "agent": "approval_worker",
         "domain": "governance",
@@ -265,7 +265,6 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
         save_state(state)
         await write_audit_log("LAYER_MILESTONE", f"{state['approved_layers_count']} layers approved", "system")
 
-    # Quorum only for manual approvals
     if not auto:
         total_agents = 200
         half = total_agents // 2
@@ -397,7 +396,7 @@ async def lung_worker():
                         save_state(state)
                         await write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation", "lung")
 
-            # Insert the new mutation (without name column)
+            # Insert the new mutation (with UUID)
             db.table("mutations").insert({
                 "id": str(uuid.uuid4()),
                 "content": content,
@@ -667,11 +666,18 @@ async def get_status():
         "logs": state.get("logs", [])
     }
 
-# ---------- MODIFIED: Return ALL mutations (no limit) ----------
+# ---------- OPTIMIZED MUTATION ENDPOINTS ----------
 @app.get("/api/mutations")
 async def get_mutations():
-    res = db.table("mutations").select("*").order("timestamp", desc=True).execute()
+    """Return only the latest 100 mutations – prevents server crash."""
+    res = db.table("mutations").select("*").order("timestamp", desc=True).limit(100).execute()
     return res.data
+
+@app.get("/api/mutations/count")
+async def get_mutations_count():
+    """Return the exact count without downloading all rows."""
+    res = db.table("mutations").select("id", count="exact").limit(1).execute()
+    return {"count": res.count}
 
 @app.get("/api/state")
 async def get_full_state():
@@ -696,7 +702,6 @@ async def get_engine1_stats():
     state = get_state()
     return {"total_successes": state.get("heart_successes", 0), "last_thought": ""}
 
-# ---------- Health endpoint (already present) ----------
 @app.get("/health")
 async def health():
     return {"status": "ok", "bond": "HOLDS"}
