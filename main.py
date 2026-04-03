@@ -1,5 +1,5 @@
 # ============================================================================
-# LROS FINAL BACKEND – All Workers Included (Hybrid Lung)
+# LROS FINAL BACKEND – All Workers Included (Hybrid Lung + Discussion-to-Layer)
 # ============================================================================
 import os, asyncio, random, logging, re, json, uuid, imaplib, email, smtplib, time
 from email.policy import default
@@ -147,9 +147,10 @@ async def heart_worker():
         except Exception as e: logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Lung Worker (AI‑driven, only when stale) ----------
+# ---------- Lung Worker (AI‑driven, only when stale, reads agent messages) ----------
 async def lung_worker():
-    """Generates AI mutations only when no new mutations have appeared recently."""
+    """Generates AI mutations only when no new mutations have appeared recently.
+       Also includes recent agent messages for context."""
     while True:
         try:
             # Check if any mutation was created in the last hour
@@ -157,17 +158,20 @@ async def lung_worker():
             if last_mut.data:
                 last_time = datetime.fromisoformat(last_mut.data[0]["created_at"].replace('Z', '+00:00'))
                 if datetime.now().astimezone() - last_time < timedelta(hours=1):
-                    # Still fresh – skip AI call
                     await asyncio.sleep(600)
                     continue
 
-            # No recent mutation – generate one using AI
+            # Fetch recent agent messages for context
+            agent_msgs = db.table("agent_messages").select("message").order("sent_at", desc=True).limit(10).execute()
+            context = ""
+            if agent_msgs.data:
+                context = "Recent agent discussions:\n" + "\n".join([f"- {m['message']}" for m in agent_msgs.data]) + "\n"
+
             threshold = get_config_int("ombudsman_threshold", 85)
             domain = random.choice(["Medical Innovation","Longevity Science","Regulatory Compliance","Venture Architecture"])
-            prompt = f"Generate a novel mutation strategy in domain: {domain}. Keep it under 300 characters."
+            prompt = f"{context}\nGenerate a novel mutation strategy in domain: {domain}. Keep it under 300 characters."
             content = call_ai(prompt, temperature=0.8)
             if content and not content.startswith("[Simulated]"):
-                # Score it
                 score_prompt = f"Rate from 0 to 100 (100 perfect). Return only integer.\nStrategy: {content}\nScore:"
                 score_resp = call_ai(score_prompt, temperature=0.2)
                 try:
@@ -175,7 +179,6 @@ async def lung_worker():
                     score = max(0, min(100, score))
                 except:
                     score = random.randint(70, 95)
-                # Accept or veto
                 veto_reason = None if score >= threshold else f"Score {score} below threshold"
                 db.table("mutations").insert({
                     "id": str(uuid.uuid4()),
@@ -191,7 +194,53 @@ async def lung_worker():
                 await write_audit_log("LUNG_WORKER", f"Generated mutation (score {score})", "lung")
         except Exception as e:
             logger.error(f"Lung worker error: {e}")
-        await asyncio.sleep(3600)  # check every hour
+        await asyncio.sleep(3600)
+
+# ---------- Discussion-to-Layer Worker ----------
+async def discussion_to_layer_worker():
+    """Turns unprocessed agent messages into new constitutional layer proposals."""
+    while True:
+        try:
+            # Fetch up to 20 unprocessed messages
+            msgs = db.table("agent_messages").select("id, message, round, sent_at").eq("processed", False).order("sent_at", desc=True).limit(20).execute()
+            if not msgs.data:
+                await asyncio.sleep(600)
+                continue
+
+            discussion = "\n".join([f"[Round {m['round']}] {m['message']}" for m in msgs.data])
+            prompt = f"""You are the Ombudsman. Based on the following agent discussion, propose a new constitutional layer (rule) that should be added to LROS.
+
+Discussion:
+{discussion}
+
+Output JSON: {{"name": "short name", "description": "detailed rule", "type": "constitutional"}}"""
+            response = call_ai(prompt, temperature=0.5)
+            try:
+                proposal = json.loads(response)
+            except:
+                proposal = {"name": "Agent‑derived layer", "description": discussion[:300], "type": "constitutional"}
+
+            result = db.table("layer_proposals").insert({
+                "name": proposal["name"],
+                "description": proposal["description"],
+                "status": "pending",
+                "type": proposal.get("type", "constitutional"),
+                "created_at": datetime.utcnow().isoformat()
+            }).execute()
+            layer_id = result.data[0]["id"]
+
+            state = get_state()
+            state["pending_layers"].append({"id": layer_id, "name": proposal["name"], "description": proposal["description"]})
+            save_state(state)
+
+            # Mark messages as processed
+            for msg in msgs.data:
+                db.table("agent_messages").update({"processed": True}).eq("id", msg["id"]).execute()
+
+            await write_audit_log("DISCUSSION_LAYER", f"Generated layer from {len(msgs.data)} messages", "discussion_worker")
+        except Exception as e:
+            logger.error(f"Discussion worker error: {e}")
+        await asyncio.sleep(600)
 
 # ---------- Approval Worker ----------
 async def approval_worker(worker_id):
@@ -270,7 +319,6 @@ async def email_ingest_worker():
                     state["daily_learning"] += 500.5
                     state["logs"].insert(0, f"[EMAIL] Ingested from {sender}")
                     save_state(state)
-                # Process attachments (text only)
                 for part in msg.walk():
                     if part.get_content_disposition() == "attachment":
                         filename = part.get_filename()
@@ -295,7 +343,7 @@ async def daily_digest_worker():
         return
     while True:
         now = datetime.utcnow()
-        next_run = datetime(now.year, now.month, now.day, 8, 0)  # 8 AM UTC
+        next_run = datetime(now.year, now.month, now.day, 8, 0)
         if now >= next_run:
             next_run += timedelta(days=1)
         await asyncio.sleep((next_run - now).total_seconds())
@@ -321,7 +369,6 @@ async def auto_remediation_worker():
                 for layer in to_approve:
                     await approve_layer_by_id(layer["id"], auto=True)
                 await write_audit_log("AUTO_REMEDIATION", f"Approved {len(to_approve)} pending layers (backlog >50)", "system")
-            # Check if last mutation was more than 1 hour ago
             last_mut = db.table("mutations").select("timestamp").order("timestamp", desc=True).limit(1).execute()
             if last_mut.data:
                 last_time = datetime.fromisoformat(last_mut.data[0]["timestamp"].replace('Z', '+00:00'))
@@ -345,11 +392,10 @@ async def shadow_ombudsman_worker():
             logger.error(f"Shadow Ombudsman error: {e}")
         await asyncio.sleep(3600)
 
-# ---------- Extrapolation Swarm (zero‑cost mutations) ----------
+# ---------- Extrapolation Swarm ----------
 async def extrapolation_swarm():
     while True:
         try:
-            # Get 5 random knowledge vault entries
             vault = db.table("knowledge_vault").select("content").order("created_at", desc=True).limit(10).execute()
             if vault.data:
                 for v in vault.data[:3]:
@@ -482,7 +528,7 @@ async def reset_counters():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(heart_worker())
-    asyncio.create_task(lung_worker())          # AI‑driven, only when stale
+    asyncio.create_task(lung_worker())
     for i in range(APPROVAL_WORKERS_COUNT):
         asyncio.create_task(approval_worker(i))
     asyncio.create_task(email_ingest_worker())
@@ -491,6 +537,7 @@ async def startup():
     asyncio.create_task(shadow_ombudsman_worker())
     asyncio.create_task(extrapolation_swarm())
     asyncio.create_task(medical_scavenger())
+    asyncio.create_task(discussion_to_layer_worker())   # <-- ADDED
     logger.info("LROS started – all workers active")
 
 if __name__ == "__main__":
