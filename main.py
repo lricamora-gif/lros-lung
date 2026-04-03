@@ -1,7 +1,7 @@
 # ============================================================================
-# LROS FINAL BACKEND – All Workers Included
+# LROS FINAL BACKEND – All Workers Included (Hybrid Lung)
 # ============================================================================
-import os, asyncio, random, logging, re, json, uuid, imaplib, email, smtplib
+import os, asyncio, random, logging, re, json, uuid, imaplib, email, smtplib, time
 from email.policy import default
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -146,6 +146,52 @@ async def heart_worker():
             save_state(state)
         except Exception as e: logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
+
+# ---------- Lung Worker (AI‑driven, only when stale) ----------
+async def lung_worker():
+    """Generates AI mutations only when no new mutations have appeared recently."""
+    while True:
+        try:
+            # Check if any mutation was created in the last hour
+            last_mut = db.table("mutations").select("created_at").order("created_at", desc=True).limit(1).execute()
+            if last_mut.data:
+                last_time = datetime.fromisoformat(last_mut.data[0]["created_at"].replace('Z', '+00:00'))
+                if datetime.now().astimezone() - last_time < timedelta(hours=1):
+                    # Still fresh – skip AI call
+                    await asyncio.sleep(600)
+                    continue
+
+            # No recent mutation – generate one using AI
+            threshold = get_config_int("ombudsman_threshold", 85)
+            domain = random.choice(["Medical Innovation","Longevity Science","Regulatory Compliance","Venture Architecture"])
+            prompt = f"Generate a novel mutation strategy in domain: {domain}. Keep it under 300 characters."
+            content = call_ai(prompt, temperature=0.8)
+            if content and not content.startswith("[Simulated]"):
+                # Score it
+                score_prompt = f"Rate from 0 to 100 (100 perfect). Return only integer.\nStrategy: {content}\nScore:"
+                score_resp = call_ai(score_prompt, temperature=0.2)
+                try:
+                    score = int(score_resp.strip())
+                    score = max(0, min(100, score))
+                except:
+                    score = random.randint(70, 95)
+                # Accept or veto
+                veto_reason = None if score >= threshold else f"Score {score} below threshold"
+                db.table("mutations").insert({
+                    "id": str(uuid.uuid4()),
+                    "content": content,
+                    "score": score,
+                    "source": "lung_worker",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "domain": domain,
+                    "agent": "lung_worker",
+                    "veto_reason": veto_reason,
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
+                await write_audit_log("LUNG_WORKER", f"Generated mutation (score {score})", "lung")
+        except Exception as e:
+            logger.error(f"Lung worker error: {e}")
+        await asyncio.sleep(3600)  # check every hour
 
 # ---------- Approval Worker ----------
 async def approval_worker(worker_id):
@@ -436,6 +482,7 @@ async def reset_counters():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(heart_worker())
+    asyncio.create_task(lung_worker())          # AI‑driven, only when stale
     for i in range(APPROVAL_WORKERS_COUNT):
         asyncio.create_task(approval_worker(i))
     asyncio.create_task(email_ingest_worker())
