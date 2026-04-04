@@ -26,7 +26,7 @@ logger = logging.getLogger("lros-backend")
 # Supabase Client
 # ------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # Use service role for writes
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # service role for writes
 if not SUPABASE_URL or not SUPABASE_KEY:
     logger.warning("Supabase credentials missing – database features disabled")
     supabase = None
@@ -34,7 +34,7 @@ else:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ------------------------------------------------------------------
-# AI Configuration (Mistral first)
+# AI Configuration (Mistral first, then fallbacks)
 # ------------------------------------------------------------------
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -199,10 +199,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LROS Chat API", version="3.0", lifespan=lifespan)
 
+# ========== FIXED CORS: wildcard origin cannot have credentials ==========
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,      # MUST be False when origin is "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -259,6 +260,7 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_chat():
+    # Read the chat.html file from the same directory
     with open("chat.html", "r") as f:
         return HTMLResponse(content=f.read())
 
