@@ -1,6 +1,6 @@
-fastapi
-uvicorn
-supabase
-python-multipart
-requests
-google-generativeai
+fastapi>=0.100.0
+uvicorn>=0.23.0
+supabase>=2.3.0
+requests>=2.31.0
+python-multipart>=0.0.6
+google-generativeai>=0.3.0
