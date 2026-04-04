@@ -1,6 +1,7 @@
-fastapi==0.115.11
+fastapi==0.95.2
 uvicorn[standard]==0.34.0
 supabase==2.7.0
 python-dotenv==1.0.1
 httpx==0.28.1
-pydantic==2.10.6
+pydantic==1.10.18
+email-validator==2.1.1
