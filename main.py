@@ -171,7 +171,7 @@ def watch_laptop_sensors():
 
 def watch_samsung_watch():
     """
-    Samsung watch data – requires companion app on phone to forward to this script.
+    # Samsung watch data – requires companion app on phone to forward to this script.
     For simplicity, we'll assume a local HTTP endpoint on the phone that pushes data.
     You can replace with actual SDK integration.
     """
