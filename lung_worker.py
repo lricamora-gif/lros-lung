@@ -35,7 +35,6 @@ async def call_ai(prompt: str) -> str:
 async def main_loop():
     while True:
         try:
-            # Fetch one pending message
             result = supabase.table("agent_messages").select("*").eq("status", "pending").limit(1).execute()
             if result.data:
                 msg = result.data[0]
