@@ -199,11 +199,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LROS Chat API", version="3.0", lifespan=lifespan)
 
-# ========== FIXED CORS: wildcard origin cannot have credentials ==========
+# ========== CORS: wildcard allowed only with credentials=False ==========
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,      # MUST be False when origin is "*"
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -252,16 +252,123 @@ async def chat_endpoint(req: ChatRequest):
     return ChatResponse(response=response_text, session_id=session_id)
 
 # ------------------------------------------------------------------
-# Health & Root
+# Additional API Endpoints for Dashboard
 # ------------------------------------------------------------------
+@app.get("/api/state")
+async def get_state():
+    if not supabase:
+        return {"error": "Supabase not configured"}
+    res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    if not res.data:
+        return {}
+    return res.data[0]["state_data"]
+
+@app.get("/api/mutations")
+async def get_mutations(limit: int = 100):
+    if not supabase:
+        return []
+    res = supabase.table("mutations").select("*").order("timestamp", desc=True).limit(limit).execute()
+    return res.data
+
+@app.get("/api/mutations/count")
+async def get_mutations_count():
+    if not supabase:
+        return {"count": 0}
+    res = supabase.table("mutations").select("id", count="exact").execute()
+    return {"count": res.count}
+
+@app.post("/api/layers/approve")
+async def approve_layer(layer_id: str):
+    if not supabase:
+        raise HTTPException(500, "Supabase not configured")
+    # Check if exists
+    check = supabase.table("layer_proposals").select("id").eq("id", layer_id).execute()
+    if not check.data:
+        raise HTTPException(404, "Layer not found")
+    supabase.table("layer_proposals").update({"status": "approved", "approved_at": datetime.utcnow().isoformat()}).eq("id", layer_id).execute()
+    # Update sovereign_state: remove from pending_layers and increment approved count
+    state_res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    if state_res.data:
+        state = state_res.data[0]["state_data"]
+        pending = state.get("pending_layers", [])
+        new_pending = [p for p in pending if p.get("id") != layer_id]
+        state["pending_layers"] = new_pending
+        state["approved_layers_count"] = state.get("approved_layers_count", 0) + 1
+        state["daily_learning"] = state.get("daily_learning", 0) + 0.1
+        supabase.table("sovereign_state").update({"state_data": state}).eq("id", 1).execute()
+    return {"status": "approved"}
+
+@app.post("/api/layers/reject")
+async def reject_layer(layer_id: str):
+    if not supabase:
+        raise HTTPException(500, "Supabase not configured")
+    supabase.table("layer_proposals").update({"status": "rejected"}).eq("id", layer_id).execute()
+    # Remove from pending_layers
+    state_res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    if state_res.data:
+        state = state_res.data[0]["state_data"]
+        pending = state.get("pending_layers", [])
+        new_pending = [p for p in pending if p.get("id") != layer_id]
+        state["pending_layers"] = new_pending
+        supabase.table("sovereign_state").update({"state_data": state}).eq("id", 1).execute()
+    return {"status": "rejected"}
+
+@app.post("/api/lung/secure_baseline")
+async def secure_baseline():
+    if not supabase:
+        raise HTTPException(500, "Supabase not configured")
+    state_res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    if not state_res.data:
+        raise HTTPException(404, "State not found")
+    state = state_res.data[0]["state_data"]
+    total = state.get("baseline_anchor", 0) + state.get("heart_successes", 0) + state.get("lung_successes", 0)
+    old = state.get("baseline_anchor", 0)
+    state["baseline_anchor"] = total
+    state["heart_successes"] = 0
+    state["lung_successes"] = 0
+    supabase.table("sovereign_state").update({"state_data": state}).eq("id", 1).execute()
+    # Log to memory_logs
+    supabase.table("memory_logs").insert({
+        "event_type": "BASELINE_ANCHOR",
+        "description": f"Baseline anchored from {old} to {total}",
+        "master_tally": total,
+        "baseline": total,
+        "heart_total": 0,
+        "lung_total": 0,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    return {"new_baseline": total}
+
+@app.post("/api/admin/reset_counters")
+async def reset_counters():
+    if not supabase:
+        raise HTTPException(500, "Supabase not configured")
+    state_res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    if state_res.data:
+        state = state_res.data[0]["state_data"]
+        state["heart_successes"] = 0
+        state["lung_successes"] = 0
+        state["rejections"] = 0
+        state["uses"] = 0
+        state["daily_learning"] = 0
+        state["baseline_anchor"] = 1000000
+        state["approved_layers_count"] = 0
+        supabase.table("sovereign_state").update({"state_data": state}).eq("id", 1).execute()
+    return {"status": "reset"}
+
+@app.post("/api/ingest")
+async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optional[str] = Form(None), text: Optional[str] = Form(None)):
+    # Simplified for demo; in production you'd handle file uploads
+    return {"status": "ingested"}
+
 @app.get("/health")
 async def health():
-    return {"status": "LROS operational", "layers": "5,847+"}
+    return {"status": "ok", "bond": "HOLDS"}
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_chat():
-    # Read the chat.html file from the same directory
-    with open("chat.html", "r") as f:
+    # You'll serve index.html separately; but for completeness:
+    with open("index.html", "r") as f:
         return HTMLResponse(content=f.read())
 
 # ------------------------------------------------------------------
