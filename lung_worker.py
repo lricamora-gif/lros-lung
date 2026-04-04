@@ -23,14 +23,22 @@ SLEEP_SECONDS = int(os.getenv("LUNG_SLEEP_SECONDS", "30"))
 
 async def call_ai(prompt: str) -> str:
     if not MISTRAL_API_KEY:
-        return "[MOCK] No Mistral key"
+        return f"[MOCK] Simulated response to: {prompt[:100]}"
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(
-            "https://api.mistral.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "mistral-large-latest", "messages": [{"role": "user", "content": prompt}], "temperature": 0.8}
-        )
-        return r.json()["choices"][0]["message"]["content"]
+        try:
+            r = await client.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "mistral-large-latest", "messages": [{"role": "user", "content": prompt}], "temperature": 0.8}
+            )
+            if r.status_code == 401:
+                logger.error("Mistral API key invalid – using mock response")
+                return f"[MOCK] Invalid API key. Response to: {prompt[:100]}"
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.error(f"Mistral call failed: {e}")
+            return f"[MOCK] Fallback response to: {prompt[:100]}"
 
 async def main_loop():
     while True:
