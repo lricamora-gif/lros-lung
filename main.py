@@ -1,5 +1,5 @@
 # ============================================================================
-# LROS FINAL BACKEND – All Workers Included (Clean, Error‑Free)
+# LROS FINAL – Complete, Error‑Free, All Workers + Police + Scavengers + Health Monitor
 # ============================================================================
 import os
 import asyncio
@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from typing import Optional
 import requests
+import aiohttp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Sovereign")
@@ -70,13 +71,16 @@ def set_config(key, val):
     db.table("system_config").upsert({"key": key, "value": str(val)}).execute()
 
 def send_email(to, subject, body):
-    if not to: return
+    if not to or not LROS_EMAIL_PASSWORD:
+        logger.warning("Email not sent: missing recipient or password")
+        return
     try:
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(LROS_EMAIL, LROS_EMAIL_PASSWORD)
             msg = f"Subject: {subject}\n\n{body}"
             server.sendmail(LROS_EMAIL, to, msg)
+            logger.info(f"Email sent to {to}")
     except Exception as e:
         logger.error(f"Email send error: {e}")
 
@@ -157,7 +161,7 @@ async def heart_worker():
         except Exception as e: logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Lung Worker (AI‑driven, only when stale, reads agent messages) ----------
+# ---------- Lung Worker ----------
 async def lung_worker():
     while True:
         try:
@@ -209,10 +213,7 @@ async def discussion_to_layer_worker():
                 await asyncio.sleep(600)
                 continue
             discussion = "\n".join([f"[Round {m['round']}] {m['message']}" for m in msgs.data])
-            prompt = f"""You are the Ombudsman. Based on the following agent discussion, propose a new constitutional layer (rule) that should be added to LROS.
-Discussion:
-{discussion}
-Output JSON: {{"name": "short name", "description": "detailed rule", "type": "constitutional"}}"""
+            prompt = f"You are the Ombudsman. Based on the following agent discussion, propose a new constitutional layer (rule) that should be added to LROS.\nDiscussion:\n{discussion}\nOutput JSON: {{\"name\": \"short name\", \"description\": \"detailed rule\", \"type\": \"constitutional\"}}"
             response = call_ai(prompt, temperature=0.5)
             try:
                 proposal = json.loads(response)
@@ -399,8 +400,13 @@ async def extrapolation_swarm():
             logger.error(f"Extrapolation swarm error: {e}")
         await asyncio.sleep(1800)
 
-# ---------- Medical Scavenger ----------
+# ---------- Medical Scavenger (fixed: ensure processed column exists) ----------
 async def medical_scavenger():
+    # Ensure column exists (idempotent)
+    try:
+        db.table("knowledge_vault").select("processed").limit(1).execute()
+    except Exception:
+        db.execute("ALTER TABLE knowledge_vault ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT FALSE")
     medical_keywords = ["cancer", "longevity", "robotics", "hyperthermia", "painbot", "stem cell", "exosome", "PET/CT", "LINAC", "diabetes", "CKD"]
     while True:
         try:
@@ -415,6 +421,238 @@ async def medical_scavenger():
         except Exception as e:
             logger.error(f"Medical scavenger error: {e}")
         await asyncio.sleep(600)
+
+# ---------- Knowledge Vault Scavenger (non-idle) ----------
+async def knowledge_vault_scavenger():
+    while True:
+        try:
+            unprocessed = db.table("knowledge_vault").select("*").eq("processed", False).limit(10).execute()
+            if not unprocessed.data:
+                await asyncio.sleep(30)
+                continue
+            for item in unprocessed.data:
+                prompt = f"Convert the following knowledge into a concise, actionable mutation (max 200 chars):\n{item['content']}"
+                mutation_text = call_ai(prompt, temperature=0.6)
+                if mutation_text and not mutation_text.startswith("[Simulated]"):
+                    score_prompt = f"Rate 0-100 (100 perfect). Return only integer.\n{mutation_text}\nScore:"
+                    score_resp = call_ai(score_prompt, temperature=0.2)
+                    try:
+                        score = int(score_resp.strip())
+                        score = max(0, min(100, score))
+                    except:
+                        score = 70
+                    db.table("mutations").insert({
+                        "id": str(uuid.uuid4()),
+                        "content": mutation_text,
+                        "score": score,
+                        "source": "knowledge_scavenger",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "domain": "general",
+                        "agent": "scavenger",
+                        "veto_reason": None if score >= get_config_int("ombudsman_threshold", 85) else f"Score {score} below threshold",
+                        "created_at": datetime.utcnow().isoformat()
+                    }).execute()
+                db.table("knowledge_vault").update({"processed": True}).eq("id", item["id"]).execute()
+                await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Knowledge scavenger error: {e}")
+        await asyncio.sleep(5)
+
+# ---------- Memory Scavenger ----------
+async def memory_scavenger():
+    while True:
+        try:
+            msgs = db.table("agent_messages").select("id, message").eq("processed", False).limit(20).execute()
+            for msg in msgs.data:
+                prompt = f"Based on this agent message, propose a concrete improvement (mutation) for LROS. Keep under 200 chars.\nMessage: {msg['message']}"
+                improvement = call_ai(prompt, temperature=0.7)
+                if improvement and not improvement.startswith("[Simulated]"):
+                    db.table("mutations").insert({
+                        "id": str(uuid.uuid4()),
+                        "content": improvement,
+                        "score": 80,
+                        "source": "memory_scavenger",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "domain": "governance",
+                        "agent": "memory_scavenger",
+                        "veto_reason": None,
+                        "created_at": datetime.utcnow().isoformat()
+                    }).execute()
+                db.table("agent_messages").update({"processed": True}).eq("id", msg["id"]).execute()
+            errors = db.table("error_analysis").select("*").gte("frequency", 3).limit(10).execute()
+            for err in errors.data:
+                existing = db.table("layer_proposals").select("id").ilike("description", f"%{err['error_pattern']}%").execute()
+                if not existing.data:
+                    layer_name = f"Prevent: {err['error_pattern'][:60]}"
+                    layer_desc = f"Auto-generated to prevent error pattern: {err['error_pattern']} (frequency {err['frequency']})"
+                    db.table("layer_proposals").insert({
+                        "name": layer_name,
+                        "description": layer_desc,
+                        "status": "pending",
+                        "type": "error_prevention",
+                        "created_at": datetime.utcnow().isoformat()
+                    }).execute()
+        except Exception as e:
+            logger.error(f"Memory scavenger error: {e}")
+        await asyncio.sleep(60)
+
+# ---------- Police Agents (10 parallel) ----------
+async def police_agent(agent_id):
+    while True:
+        try:
+            recent_muts = db.table("mutations").select("score").order("timestamp", desc=True).limit(50).execute()
+            if recent_muts.data:
+                avg_score = sum(m["score"] for m in recent_muts.data) / len(recent_muts.data)
+                if avg_score < get_config_int("ombudsman_threshold", 85):
+                    db.table("agent_messages").insert({
+                        "agent_id": f"police_{agent_id}",
+                        "message": f"Average mutation score {avg_score:.1f} below threshold. Consider raising mutation quality.",
+                        "round": 0,
+                        "sent_at": datetime.utcnow().isoformat(),
+                        "processed": False
+                    }).execute()
+            stuck_layers = db.table("layer_proposals").select("*").eq("status", "pending").eq("type", "error_prevention").lt("created_at", datetime.utcnow() - timedelta(hours=1)).execute()
+            for layer in stuck_layers.data[:5]:
+                await approve_layer_by_id(layer["id"], auto=True)
+                db.table("agent_messages").insert({
+                    "agent_id": f"police_{agent_id}",
+                    "message": f"Auto-approved stuck error-prevention layer: {layer['name']}",
+                    "round": 0,
+                    "sent_at": datetime.utcnow().isoformat(),
+                    "processed": False
+                }).execute()
+            last_mut = db.table("mutations").select("created_at").order("created_at", desc=True).limit(1).execute()
+            if last_mut.data:
+                last_time = datetime.fromisoformat(last_mut.data[0]["created_at"].replace('Z', '+00:00'))
+                if datetime.now().astimezone() - last_time > timedelta(hours=2):
+                    db.table("agent_messages").insert({
+                        "agent_id": f"police_{agent_id}",
+                        "message": "No new mutations for 2 hours. Check AI keys and workers.",
+                        "round": 0,
+                        "sent_at": datetime.utcnow().isoformat(),
+                        "processed": False
+                    }).execute()
+            if agent_id == 1 and datetime.utcnow().hour == 23 and datetime.utcnow().minute < 5:
+                state = get_state()
+                total_mutations = db.table("mutations").select("id", count="exact").execute().count
+                report = f"Police Report:\n- Pending layers: {len(state.get('pending_layers', []))}\n- Total mutations: {total_mutations}\n- Veto rate: {state.get('rejections',0)}/{state.get('lung_successes',1)}"
+                db.table("agent_messages").insert({
+                    "agent_id": "police_lead",
+                    "message": report,
+                    "round": 0,
+                    "sent_at": datetime.utcnow().isoformat(),
+                    "processed": False
+                }).execute()
+        except Exception as e:
+            logger.error(f"Police agent {agent_id} error: {e}")
+        await asyncio.sleep(300)
+
+# ---------- Learning Broadcast ----------
+async def learning_broadcast():
+    while True:
+        try:
+            top_patterns = db.table("pattern_library").select("content, score").order("score", desc=True).limit(3).execute()
+            high_muts = db.table("mutations").select("content").gte("score", 95).order("timestamp", desc=True).limit(5).execute()
+            good_layers = db.table("layer_proposals").select("name, description").eq("status", "approved").eq("type", "error_prevention").order("approved_at", desc=True).limit(3).execute()
+            message = "Learning Broadcast:\n"
+            if top_patterns.data:
+                message += "Top patterns:\n" + "\n".join([f"- {p['content'][:100]} (score {p['score']})" for p in top_patterns.data]) + "\n"
+            if high_muts.data:
+                message += "Recent high-score mutations:\n" + "\n".join([f"- {m['content'][:100]}" for m in high_muts.data]) + "\n"
+            if good_layers.data:
+                message += "Recent error-prevention layers:\n" + "\n".join([f"- {l['name']}: {l['description'][:100]}" for l in good_layers.data]) + "\n"
+            db.table("agent_messages").insert({
+                "agent_id": "learning_broadcast",
+                "message": message,
+                "round": 0,
+                "sent_at": datetime.utcnow().isoformat(),
+                "processed": False
+            }).execute()
+        except Exception as e:
+            logger.error(f"Learning broadcast error: {e}")
+        await asyncio.sleep(3600)
+
+# ---------- Daily EOD Worker (runs retrospective analysis daily) ----------
+async def daily_eod_worker():
+    while True:
+        now = datetime.utcnow()
+        next_run = datetime(now.year, now.month, now.day, 23, 59)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        state = get_state()
+        await run_retrospective_analysis(state.get("approved_layers_count", 0))
+        logger.info("Daily EOD analysis completed")
+
+# ---------- Health Monitor (internal) ----------
+async def health_monitor_worker():
+    consecutive_failures = 0
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://localhost:8000/health", timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("bond") == "HOLDS":
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                    else:
+                        consecutive_failures += 1
+        except Exception:
+            consecutive_failures += 1
+        if consecutive_failures >= 2:
+            send_email(DAILY_DIGEST_EMAIL, "LROS Persistent Failure Alert",
+                       f"Backend has been unresponsive or failing for 10 minutes. Check Render logs immediately.")
+            consecutive_failures = 0
+        await asyncio.sleep(300)
+
+# ---------- Retrospective Analysis (existing) ----------
+async def run_retrospective_analysis(cycle_number):
+    vetoed = db.table("mutations").select("content","score","veto_reason","domain").lt("score",85).order("timestamp", desc=True).limit(200).execute()
+    if not vetoed.data:
+        return
+    error_counts = {}
+    for m in vetoed.data:
+        reason = m.get("veto_reason") or f"Score {m['score']} below threshold"
+        error_counts[reason] = error_counts.get(reason, 0) + 1
+    top_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    for err, freq in top_errors:
+        db.table("error_analysis").insert({
+            "cycle_number": cycle_number,
+            "error_pattern": err,
+            "frequency": freq,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+    prompt = f"Top errors causing rejections: {top_errors}. Propose 5 layer improvements (name, description) as JSON array."
+    try:
+        response = call_ai(prompt, temperature=0.7)
+        proposals = json.loads(response)
+        for prop in proposals[:5]:
+            result = db.table("layer_proposals").insert({
+                "name": prop["name"],
+                "description": prop["description"],
+                "status": "pending",
+                "type": "error_prevention",
+                "created_at": datetime.utcnow().isoformat()
+            }).execute()
+            layer_id = result.data[0]["id"]
+            state = get_state()
+            state["pending_layers"].append({"id": layer_id, "name": prop["name"], "description": prop["description"]})
+            save_state(state)
+    except Exception as e:
+        logger.error(f"Retrospective analysis failed: {e}")
+    total_agents = 200
+    msg = f"Retrospective Cycle {cycle_number}: Top errors: {top_errors[0][0] if top_errors else 'none'}. New layers proposed."
+    for i in range(1, total_agents+1):
+        db.table("agent_messages").insert({
+            "layer_id": None,
+            "agent_id": str(i),
+            "message": msg,
+            "round": 0,
+            "sent_at": datetime.utcnow().isoformat()
+        }).execute()
+    await write_audit_log("RETROSPECTIVE_ANALYSIS", f"Cycle {cycle_number}: Analyzed {len(vetoed.data)} vetoes", "system")
 
 # ---------- Chat Endpoint ----------
 @app.post("/api/chat")
@@ -431,6 +669,8 @@ async def chat(request: dict):
         context += "Relevant business insights:\n" + "\n".join([m["content"] for m in bus_muts.data]) + "\n"
     prompt = f"{context}\nUser: {message}\nAssistant:"
     response = call_ai(prompt, temperature=0.7)
+    # Ensure chat_logs table exists (run once)
+    db.execute("CREATE TABLE IF NOT EXISTS chat_logs (id SERIAL PRIMARY KEY, session_id TEXT, user_message TEXT, assistant_response TEXT, domain TEXT, created_at TIMESTAMPTZ DEFAULT NOW())")
     db.table("chat_logs").insert({
         "session_id": session_id,
         "user_message": message,
@@ -552,6 +792,15 @@ async def reset_counters():
 
 @app.on_event("startup")
 async def startup():
+    # Ensure required columns exist
+    try:
+        db.table("knowledge_vault").select("processed").limit(1).execute()
+    except Exception:
+        db.execute("ALTER TABLE knowledge_vault ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT FALSE")
+    try:
+        db.execute("CREATE TABLE IF NOT EXISTS chat_logs (id SERIAL PRIMARY KEY, session_id TEXT, user_message TEXT, assistant_response TEXT, domain TEXT, created_at TIMESTAMPTZ DEFAULT NOW())")
+    except:
+        pass
     asyncio.create_task(heart_worker())
     asyncio.create_task(lung_worker())
     for i in range(APPROVAL_WORKERS_COUNT):
@@ -563,6 +812,13 @@ async def startup():
     asyncio.create_task(extrapolation_swarm())
     asyncio.create_task(medical_scavenger())
     asyncio.create_task(discussion_to_layer_worker())
+    asyncio.create_task(knowledge_vault_scavenger())
+    asyncio.create_task(memory_scavenger())
+    for i in range(1, 11):
+        asyncio.create_task(police_agent(i))
+    asyncio.create_task(learning_broadcast())
+    asyncio.create_task(daily_eod_worker())
+    asyncio.create_task(health_monitor_worker())
     logger.info("LROS started – all workers active")
 
 if __name__ == "__main__":
