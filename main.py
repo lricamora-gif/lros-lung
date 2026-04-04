@@ -1,58 +1,65 @@
 # ============================================================================
-# LROS FINAL – ERROR‑FREE, NO AIOHTTP, ALL WORKERS
+# LROS – Complete Integrated Backend (Projects 1,2,3) – STABLE + SWARM LEARN
 # ============================================================================
+
 import os
 import asyncio
 import random
 import logging
 import re
 import json
-import uuid
-import imaplib
-import email
-import smtplib
-import time
-from email.policy import default
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from supabase import create_client
+from supabase import create_client, Client
 from typing import Optional
 import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Sovereign")
+
 app = FastAPI(title="LROS Sovereign Engine")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# CORS – update allowed origins for production
-ALLOWED_ORIGINS = [
-    "https://lros.ai",
-    "https://www.lros.ai",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-]
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
+# ---------- Supabase ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise Exception("Missing SUPABASE_URL or SUPABASE_KEY")
-db = create_client(SUPABASE_URL, SUPABASE_KEY)
+db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ---------- Constants ----------
 AUTO_APPROVE_THRESHOLD = int(os.environ.get("AUTO_APPROVE_THRESHOLD", "5"))
-APPROVAL_WORKERS_COUNT = int(os.environ.get("APPROVAL_WORKERS_COUNT", "20"))
-LROS_EMAIL = os.environ.get("LROS_EMAIL", "lrosventures@gmail.com")
-LROS_EMAIL_PASSWORD = os.environ.get("LROS_EMAIL_PASSWORD")
-DAILY_DIGEST_EMAIL = os.environ.get("DAILY_DIGEST_EMAIL")
+APPROVAL_WORKERS_COUNT = int(os.environ.get("APPROVAL_WORKERS_COUNT", "15"))
 
-# ---------- Helper functions ----------
+# ---------- Helper: Write Audit Log ----------
 async def write_audit_log(event_type, description, source, metadata=None):
-    db.table("audit_log").insert({"event_type": event_type, "description": description, "source": source, "metadata": metadata or {}, "created_at": datetime.utcnow().isoformat()}).execute()
+    db.table("audit_log").insert({
+        "event_type": event_type,
+        "description": description,
+        "source": source,
+        "metadata": metadata or {},
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
 
+# ---------- State Management ----------
 def get_state():
     res = db.table("sovereign_state").select("state_data").eq("id", 1).execute()
     if not res.data:
-        default = {"baseline_anchor": 1000000, "heart_successes": 0, "lung_successes": 0, "rejections": 0, "uses": 0, "daily_learning": 0, "active_agent": "000", "mutation_ledger": [], "logs": [], "pending_layers": [], "approved_layers_count": 0, "knowledge_vault": []}
+        default = {
+            "baseline_anchor": 1000000,
+            "heart_successes": 0,
+            "lung_successes": 0,
+            "rejections": 0,
+            "uses": 0,
+            "daily_learning": 0,
+            "active_agent": "000",
+            "mutation_ledger": [],
+            "logs": [],
+            "pending_layers": [],
+            "approved_layers_count": 0,
+            "knowledge_vault": []
+        }
         db.table("sovereign_state").insert({"id": 1, "state_data": default}).execute()
         return default
     return res.data[0]["state_data"]
@@ -60,184 +67,219 @@ def get_state():
 def save_state(state):
     db.table("sovereign_state").update({"state_data": state, "updated_at": datetime.utcnow().isoformat()}).eq("id", 1).execute()
 
-def get_config_int(key, default=0):
-    res = db.table("system_config").select("value").eq("key", key).execute()
-    if res.data: return int(res.data[0]["value"])
-    db.table("system_config").insert({"key": key, "value": str(default)}).execute()
-    return default
+# ---------- Ensure initial valid pending layer ----------
+async def ensure_initial_layer():
+    state = get_state()
+    valid = []
+    for layer in state.get("pending_layers", []):
+        layer_id = layer.get("id")
+        if not layer_id:
+            continue
+        try:
+            res = db.table("layer_proposals").select("id").eq("id", layer_id).execute()
+            if res.data:
+                valid.append(layer)
+        except:
+            pass
+    if len(valid) != len(state.get("pending_layers", [])):
+        state["pending_layers"] = valid
+        save_state(state)
+    if not state.get("pending_layers"):
+        result = db.table("layer_proposals").insert({
+            "name": "Genesis Anchor Layer",
+            "description": "Initial stability layer. Establishes baseline governance.",
+            "status": "pending",
+            "type": "system",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        layer_id = result.data[0]["id"]
+        state["pending_layers"].append({"id": layer_id, "name": "Genesis Anchor Layer", "description": "Initial stability layer."})
+        save_state(state)
+        await write_audit_log("SYSTEM_LAYER", "Created initial anchor layer", "system")
 
-def set_config(key, val):
-    db.table("system_config").upsert({"key": key, "value": str(val)}).execute()
-
-def send_email(to, subject, body):
-    if not to or not LROS_EMAIL_PASSWORD:
-        logger.warning("Email not sent: missing recipient or password")
-        return
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login(LROS_EMAIL, LROS_EMAIL_PASSWORD)
-            msg = f"Subject: {subject}\n\n{body}"
-            server.sendmail(LROS_EMAIL, to, msg)
-            logger.info(f"Email sent to {to}")
-    except Exception as e:
-        logger.error(f"Email send error: {e}")
-
-# ---------- AI caller with key rotation ----------
+# ---------- AI Caller (DeepSeek + Gemini fallback) ----------
 DEEPSEEK_API_KEYS = [k.strip() for k in os.environ.get("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
 GEMINI_API_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEYS", "").split(",") if k.strip()]
-MISTRAL_API_KEYS = [k.strip() for k in os.environ.get("MISTRAL_API_KEYS", "").split(",") if k.strip()]
-GROQ_API_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEYS", "").split(",") if k.strip()]
-deepseek_idx = 0
-gemini_idx = 0
-mistral_idx = 0
-groq_idx = 0
+deepseek_index = 0
+gemini_index = 0
 
-def call_ai(prompt, temperature=0.7):
-    # Try DeepSeek
+def call_ai(prompt: str, temperature: float = 0.7) -> str:
+    global deepseek_index, gemini_index
     if DEEPSEEK_API_KEYS:
         for _ in range(len(DEEPSEEK_API_KEYS)):
-            key = DEEPSEEK_API_KEYS[deepseek_idx % len(DEEPSEEK_API_KEYS)]
-            deepseek_idx += 1
+            key = DEEPSEEK_API_KEYS[deepseek_index % len(DEEPSEEK_API_KEYS)]
+            deepseek_index += 1
             try:
                 headers = {"Authorization": f"Bearer {key}"}
-                payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": temperature}
-                r = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
-                return r.json()["choices"][0]["message"]["content"]
-            except: continue
-    # Try Mistral
-    if MISTRAL_API_KEYS:
-        for _ in range(len(MISTRAL_API_KEYS)):
-            key = MISTRAL_API_KEYS[mistral_idx % len(MISTRAL_API_KEYS)]
-            mistral_idx += 1
-            try:
-                headers = {"Authorization": f"Bearer {key}"}
-                payload = {"model": "mistral-large-latest", "messages": [{"role": "user", "content": prompt}], "temperature": temperature}
-                r = requests.post("https://api.mistral.ai/v1/chat/completions", json=payload, headers=headers, timeout=30)
-                return r.json()["choices"][0]["message"]["content"]
-            except: continue
-    # Try Groq
-    if GROQ_API_KEYS:
-        for _ in range(len(GROQ_API_KEYS)):
-            key = GROQ_API_KEYS[groq_idx % len(GROQ_API_KEYS)]
-            groq_idx += 1
-            try:
-                headers = {"Authorization": f"Bearer {key}"}
-                payload = {"model": "mixtral-8x7b-32768", "messages": [{"role": "user", "content": prompt}], "temperature": temperature}
-                r = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=30)
-                return r.json()["choices"][0]["message"]["content"]
-            except: continue
-    # Try Gemini
+                payload = {
+                    "model": "deepseek-chat",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature
+                }
+                response = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
+                return response.json()["choices"][0]["message"]["content"]
+            except Exception as e:
+                logger.warning(f"DeepSeek key {key[:5]}... failed: {e}")
+                continue
     if GEMINI_API_KEYS:
         import google.generativeai as genai
         for _ in range(len(GEMINI_API_KEYS)):
-            key = GEMINI_API_KEYS[gemini_idx % len(GEMINI_API_KEYS)]
-            gemini_idx += 1
+            key = GEMINI_API_KEYS[gemini_index % len(GEMINI_API_KEYS)]
+            gemini_index += 1
             try:
                 genai.configure(api_key=key)
                 model = genai.GenerativeModel("gemini-1.5-flash")
                 response = model.generate_content(prompt, generation_config={"temperature": temperature})
                 return response.text
-            except: continue
+            except Exception as e:
+                logger.warning(f"Gemini key {key[:5]}... failed: {e}")
+                continue
     return "[Simulated] No AI key available."
+
+# ---------- Cycle Counters ----------
+def get_config_int(key, default=0):
+    res = db.table("system_config").select("value").eq("key", key).execute()
+    if res.data:
+        return int(res.data[0]["value"])
+    db.table("system_config").insert({"key": key, "value": str(default)}).execute()
+    return default
+
+def inc_config(key):
+    val = get_config_int(key) + 1
+    db.table("system_config").upsert({"key": key, "value": str(val)}).execute()
+    return val
+
+def set_config(key, val):
+    db.table("system_config").upsert({"key": key, "value": str(val)}).execute()
+
+# ---------- Mandatory Layer Generator ----------
+def create_fallback_layer(reason: str, layer_type: str = "auto_enforced"):
+    name = f"Cycle‑enforced improvement ({reason})"
+    description = "Automatically generated to comply with mandatory layer rule."
+    result = db.table("layer_proposals").insert({
+        "name": name,
+        "description": description,
+        "status": "pending",
+        "type": layer_type,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    layer_id = result.data[0]["id"]
+    state = get_state()
+    state["pending_layers"].append({"id": layer_id, "name": name, "description": description})
+    save_state(state)
+    asyncio.create_task(write_audit_log("MANDATORY_PROPOSAL_CREATED", f"Fallback layer for {reason}", "system"))
 
 # ---------- Heart Worker ----------
 async def heart_worker():
     while True:
         try:
             state = get_state()
-            state["heart_successes"] += random.randint(5, 20)
+            gain = random.randint(5, 20)
+            state["heart_successes"] += gain
             state["uses"] += random.randint(100, 600)
             state["daily_learning"] += random.uniform(0.5, 5.0)
             state["active_agent"] = str(random.randint(1, 300)).zfill(3)
             if random.random() > 0.8:
-                entry = {"version": f"DNA-E9.54.{state['heart_successes'] % 1000}", "agent": state["active_agent"], "domain": random.choice(["Medical Innovation","Longevity Science","Regulatory Compliance","Venture Architecture"]), "ts": datetime.utcnow().strftime("%H:%M:%S")}
+                domains = ["Medical Innovation", "Longevity Science", "Regulatory Compliance", "Venture Architecture"]
+                domain = random.choice(domains)
+                entry = {
+                    "version": f"DNA-E9.54.{state['heart_successes'] % 1000}",
+                    "agent": state["active_agent"],
+                    "domain": domain,
+                    "ts": datetime.utcnow().strftime("%H:%M:%S")
+                }
                 state["mutation_ledger"].insert(0, entry)
-                if len(state["mutation_ledger"]) > 20: state["mutation_ledger"].pop()
-                state["logs"].insert(0, f"{entry['version']} | +0.0{random.randint(1,5)}% | {entry['domain']} (Agent-{entry['agent']})")
-            if len(state["logs"]) > 30: state["logs"] = state["logs"][:30]
+                if len(state["mutation_ledger"]) > 20:
+                    state["mutation_ledger"].pop()
+                state["logs"].insert(0, f"{entry['version']} | +0.0{random.randint(1,5)}% | {domain} (Agent-{entry['agent']})")
+            if len(state["logs"]) > 30:
+                state["logs"] = state["logs"][:30]
             save_state(state)
-        except Exception as e: logger.error(f"Heart worker error: {e}")
+        except Exception as e:
+            logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Lung Worker ----------
-async def lung_worker():
-    while True:
-        try:
-            last_mut = db.table("mutations").select("created_at").order("created_at", desc=True).limit(1).execute()
-            if last_mut.data:
-                last_time = datetime.fromisoformat(last_mut.data[0]["created_at"].replace('Z', '+00:00'))
-                if datetime.now().astimezone() - last_time < timedelta(hours=1):
-                    await asyncio.sleep(600)
-                    continue
-            agent_msgs = db.table("agent_messages").select("message").order("sent_at", desc=True).limit(10).execute()
-            context = ""
-            if agent_msgs.data:
-                context = "Recent agent discussions:\n" + "\n".join([f"- {m['message']}" for m in agent_msgs.data]) + "\n"
-            threshold = get_config_int("ombudsman_threshold", 85)
-            domain = random.choice(["Medical Innovation","Longevity Science","Regulatory Compliance","Venture Architecture"])
-            prompt = f"{context}\nGenerate a novel mutation strategy in domain: {domain}. Keep it under 300 characters."
-            content = call_ai(prompt, temperature=0.8)
-            if content and not content.startswith("[Simulated]"):
-                score_prompt = f"Rate from 0 to 100 (100 perfect). Return only integer.\nStrategy: {content}\nScore:"
-                score_resp = call_ai(score_prompt, temperature=0.2)
-                try:
-                    score = int(score_resp.strip())
-                    score = max(0, min(100, score))
-                except:
-                    score = random.randint(70, 95)
-                veto_reason = None if score >= threshold else f"Score {score} below threshold"
-                db.table("mutations").insert({
-                    "id": str(uuid.uuid4()),
-                    "content": content,
-                    "score": score,
-                    "source": "lung_worker",
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "domain": domain,
-                    "agent": "lung_worker",
-                    "veto_reason": veto_reason,
-                    "created_at": datetime.utcnow().isoformat()
-                }).execute()
-                await write_audit_log("LUNG_WORKER", f"Generated mutation (score {score})", "lung")
-        except Exception as e:
-            logger.error(f"Lung worker error: {e}")
-        await asyncio.sleep(3600)
+# ---------- Core Approval Logic (idempotent, fast for auto) ----------
+async def approve_layer_by_id(layer_id: str, auto: bool = True):
+    check = db.table("layer_proposals").select("status").eq("id", layer_id).execute()
+    if not check.data:
+        logger.error(f"Layer {layer_id} not found")
+        return
+    if check.data[0]["status"] == "approved":
+        return
 
-# ---------- Discussion-to-Layer Worker ----------
-async def discussion_to_layer_worker():
-    while True:
-        try:
-            msgs = db.table("agent_messages").select("id, message, round, sent_at").eq("processed", False).order("sent_at", desc=True).limit(20).execute()
-            if not msgs.data:
-                await asyncio.sleep(600)
-                continue
-            discussion = "\n".join([f"[Round {m['round']}] {m['message']}" for m in msgs.data])
-            prompt = f"You are the Ombudsman. Based on the following agent discussion, propose a new constitutional layer (rule) that should be added to LROS.\nDiscussion:\n{discussion}\nOutput JSON: {{\"name\": \"short name\", \"description\": \"detailed rule\", \"type\": \"constitutional\"}}"
-            response = call_ai(prompt, temperature=0.5)
-            try:
-                proposal = json.loads(response)
-            except:
-                proposal = {"name": "Agent-derived layer", "description": discussion[:300], "type": "constitutional"}
-            result = db.table("layer_proposals").insert({
-                "name": proposal["name"],
-                "description": proposal["description"],
-                "status": "pending",
-                "type": proposal.get("type", "constitutional"),
-                "created_at": datetime.utcnow().isoformat()
+    res = db.table("layer_proposals").select("*").eq("id", layer_id).execute()
+    if not res.data:
+        return
+    layer = res.data[0]
+
+    db.table("layer_proposals").update({
+        "status": "approved",
+        "approved_at": datetime.utcnow().isoformat()
+    }).eq("id", layer_id).execute()
+
+    name = layer["name"].lower()
+    desc = layer["description"].lower()
+    impact = "System performance improved."
+    if "threshold" in name or "threshold" in desc:
+        numbers = re.findall(r"\d+", desc + name)
+        if numbers:
+            new_threshold = int(numbers[0])
+            db.table("system_config").upsert({
+                "key": "ombudsman_threshold",
+                "value": str(new_threshold),
+                "updated_at": datetime.utcnow().isoformat()
             }).execute()
-            layer_id = result.data[0]["id"]
-            state = get_state()
-            state["pending_layers"].append({"id": layer_id, "name": proposal["name"], "description": proposal["description"]})
-            save_state(state)
-            for msg in msgs.data:
-                db.table("agent_messages").update({"processed": True}).eq("id", msg["id"]).execute()
-            await write_audit_log("DISCUSSION_LAYER", f"Generated layer from {len(msgs.data)} messages", "discussion_worker")
-        except Exception as e:
-            logger.error(f"Discussion worker error: {e}")
-        await asyncio.sleep(600)
+            impact = f"Ombudsman threshold adjusted to {new_threshold}%."
 
-# ---------- Approval Worker ----------
-async def approval_worker(worker_id):
+    state = get_state()
+    learning_increment = 0.1
+    state["daily_learning"] = state.get("daily_learning", 0) + learning_increment
+    state["approved_layers_count"] = state.get("approved_layers_count", 0) + 1
+    state["baseline_anchor"] += 50000
+    state["pending_layers"] = [p for p in state.get("pending_layers", []) if p.get("id") != layer_id]
+    state["logs"].insert(0, f"[GOV] {'Auto-approved' if auto else 'Approved'} layer: {layer['name']}. +50,000 baseline. Learning +{learning_increment}%.")
+    save_state(state)
+
+    if state["approved_layers_count"] % 1000 == 0:
+        state["logs"].insert(0, f"[MILESTONE] {state['approved_layers_count']} layers approved.")
+        save_state(state)
+        await write_audit_log("LAYER_MILESTONE", f"{state['approved_layers_count']} layers approved", "system")
+
+    # Quorum only for manual approvals
+    if not auto:
+        total_agents = 200
+        half = total_agents // 2
+        explanation = f"Layer '{layer['name']}' approved. {layer['description']}. Advantage: {impact}"
+        for i in range(1, half+1):
+            db.table("agent_messages").insert({
+                "layer_id": layer["id"],
+                "agent_id": str(i),
+                "message": explanation,
+                "round": 1,
+                "sent_at": datetime.utcnow().isoformat()
+            }).execute()
+        for i in range(half+1, total_agents+1):
+            db.table("agent_messages").insert({
+                "layer_id": layer["id"],
+                "agent_id": str(i),
+                "message": f"Agent {random.randint(1,half)} explained: {explanation}",
+                "round": 2,
+                "sent_at": datetime.utcnow().isoformat()
+            }).execute()
+
+    if state["approved_layers_count"] % 5 == 0:
+        state["logs"].insert(0, f"[KNOWLEDGE EXCHANGE] {state['approved_layers_count']} layers approved.")
+        save_state(state)
+        await write_audit_log("KNOWLEDGE_EXCHANGE", f"Cycle {state['approved_layers_count']}", "system")
+
+    if state["approved_layers_count"] % 100 == 0:
+        asyncio.create_task(run_retrospective_analysis(state["approved_layers_count"]))
+
+    await write_audit_log("LAYER_APPROVED", f"Layer '{layer['name']}' approved", "governance")
+
+# ---------- Approval Worker (parallel) ----------
+async def approval_worker(worker_id: int):
     while True:
         try:
             state = get_state()
@@ -254,358 +296,105 @@ async def approval_worker(worker_id):
             logger.error(f"Approval worker {worker_id} error: {e}")
             await asyncio.sleep(1)
 
-async def approve_layer_by_id(layer_id, auto=True):
-    check = db.table("layer_proposals").select("status").eq("id", layer_id).execute()
-    if not check.data or check.data[0]["status"] == "approved": return
-    layer = db.table("layer_proposals").select("*").eq("id", layer_id).execute().data[0]
-    db.table("layer_proposals").update({"status": "approved", "approved_at": datetime.utcnow().isoformat()}).eq("id", layer_id).execute()
-    db.table("mutations").insert({"id": str(uuid.uuid4()), "source": "layer_proposal", "content": f"{layer['name']}: {layer['description']}", "score": 90, "type": layer.get("type", "constitutional"), "agent": "approval_worker", "domain": "governance", "veto_reason": None, "timestamp": datetime.utcnow().isoformat(), "created_at": datetime.utcnow().isoformat()}).execute()
-    state = get_state()
-    state["approved_layers_count"] = state.get("approved_layers_count", 0) + 1
-    state["baseline_anchor"] += 50000
-    state["pending_layers"] = [p for p in state.get("pending_layers", []) if p.get("id") != layer_id]
-    state["daily_learning"] += 0.1
-    layers_since = get_config_int("layers_since_last_mutation") + 1
-    set_config("layers_since_last_mutation", layers_since)
-    if layers_since >= 5:
-        asyncio.create_task(trigger_mutation_from_layers())
-        set_config("layers_since_last_mutation", 0)
-    save_state(state)
-    await write_audit_log("LAYER_APPROVED", f"Layer '{layer['name']}' approved", "governance")
-
-async def trigger_mutation_from_layers():
-    res = db.table("mutations").select("*").order("score", desc=True).limit(1).execute()
-    if not res.data: return
-    old = res.data[0]
-    improved = f"[Improved from {old['content']}] (auto generated after 5 layers)"
-    db.table("mutations").insert({"id": str(uuid.uuid4()), "content": improved, "score": min(100, old['score'] + 5), "source": "layer_triggered", "timestamp": datetime.utcnow().isoformat(), "domain": old.get("domain", "governance"), "agent": "layer_worker", "veto_reason": None, "created_at": datetime.utcnow().isoformat()}).execute()
-    await write_audit_log("MUTATION_ADJUSTED", f"From {old['id']} after 5 layers", "system")
-
-# ---------- Email Ingestion Worker ----------
-async def email_ingest_worker():
-    if not LROS_EMAIL_PASSWORD:
-        logger.warning("Email password not set – email worker disabled")
-        return
+# ---------- Lung Worker ----------
+async def lung_worker():
+    threshold = get_config_int("ombudsman_threshold", 85)
+    models = ["deepseek", "mistral", "groq", "gemini", "cerebras"]
+    domains = ["Medical Innovation", "Longevity Science", "Regulatory Compliance", "Venture Architecture"]
     while True:
         try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(LROS_EMAIL, LROS_EMAIL_PASSWORD)
-            mail.select("inbox")
-            status, messages = mail.search(None, "UNSEEN")
-            for num in messages[0].split():
-                status, msg_data = mail.fetch(num, "(RFC822)")
-                msg = email.message_from_bytes(msg_data[0][1], policy=default)
-                subject = msg["subject"]
-                sender = msg["from"]
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            body = part.get_payload(decode=True).decode(errors="ignore")
-                            break
-                else:
-                    body = msg.get_payload(decode=True).decode(errors="ignore")
-                if body:
-                    db.table("knowledge_vault").insert({"content": body[:5000], "source": f"email_body_{subject}", "created_at": datetime.utcnow().isoformat()}).execute()
-                    state = get_state()
-                    state["heart_successes"] += 5000
-                    state["uses"] += 25000
-                    state["daily_learning"] += 500.5
-                    state["logs"].insert(0, f"[EMAIL] Ingested from {sender}")
-                    save_state(state)
-                for part in msg.walk():
-                    if part.get_content_disposition() == "attachment":
-                        filename = part.get_filename()
-                        payload = part.get_payload(decode=True)
-                        try:
-                            text = payload.decode(errors="ignore")
-                            db.table("knowledge_vault").insert({"content": text[:5000], "source": f"email_attachment_{filename}", "created_at": datetime.utcnow().isoformat()}).execute()
-                        except:
-                            pass
-                db.table("agent_messages").insert({"agent_id": "email_worker", "message": f"Ingested email from {sender}: {subject}", "round": 0, "sent_at": datetime.utcnow().isoformat(), "processed": False}).execute()
-                mail.store(num, "+FLAGS", "\\Seen")
-            mail.close()
-            mail.logout()
-        except Exception as e:
-            logger.error(f"Email worker error: {e}")
-        await asyncio.sleep(300)
+            mutation_cycle = inc_config("mutation_cycle")
+            last_proposal = get_config_int("last_proposal_cycle")
+            expected = mutation_cycle // 5
+            if expected > last_proposal:
+                for missing in range(last_proposal + 1, expected + 1):
+                    create_fallback_layer(f"Mutation cycle {missing*5}", "mutation_mandatory")
+                set_config("last_proposal_cycle", expected)
 
-# ---------- Daily Digest Worker ----------
-async def daily_digest_worker():
-    if not DAILY_DIGEST_EMAIL:
-        logger.warning("DAILY_DIGEST_EMAIL not set – daily digest disabled")
-        return
-    while True:
-        now = datetime.utcnow()
-        next_run = datetime(now.year, now.month, now.day, 8, 0)
-        if now >= next_run:
-            next_run += timedelta(days=1)
-        await asyncio.sleep((next_run - now).total_seconds())
-        try:
-            state = get_state()
-            new_mutations = db.table("mutations").select("*").gte("created_at", datetime.utcnow().date().isoformat()).order("score", desc=True).limit(10).execute()
-            new_layers = db.table("layer_proposals").select("*").gte("created_at", datetime.utcnow().date().isoformat()).eq("status", "approved").execute()
-            new_errors = db.table("error_analysis").select("*").gte("created_at", datetime.utcnow().date().isoformat()).execute()
-            ingested = db.table("knowledge_vault").select("source").gte("created_at", datetime.utcnow().date().isoformat()).execute()
-            body = f"LROS Daily Digest – {datetime.utcnow().date()}\n\nNew Mutations (top 10):\n" + "\n".join([f"- {m['content'][:100]} (score {m['score']})" for m in new_mutations.data]) + f"\n\nNew Approved Layers: {len(new_layers.data)}\n\nNew Error Patterns: {len(new_errors.data)}\n\nIngested Sources: {len(ingested.data)}\n\nSystem Health:\n  - Heart Successes: {state['heart_successes']}\n  - Lung Successes: {state['lung_successes']}\n  - Vetoes: {state['rejections']}\n  - Pending Layers: {len(state.get('pending_layers', []))}\n\nThe bond holds."
-            send_email(DAILY_DIGEST_EMAIL, f"LROS Daily Digest {datetime.utcnow().date()}", body)
-        except Exception as e:
-            logger.error(f"Daily digest error: {e}")
-
-# ---------- Auto‑Remediation Worker ----------
-async def auto_remediation_worker():
-    while True:
-        try:
-            state = get_state()
-            pending = len(state.get("pending_layers", []))
-            if pending > 50:
-                to_approve = state["pending_layers"][:20]
-                for layer in to_approve:
-                    await approve_layer_by_id(layer["id"], auto=True)
-                await write_audit_log("AUTO_REMEDIATION", f"Approved {len(to_approve)} pending layers (backlog >50)", "system")
-            last_mut = db.table("mutations").select("timestamp").order("timestamp", desc=True).limit(1).execute()
-            if last_mut.data:
-                last_time = datetime.fromisoformat(last_mut.data[0]["timestamp"].replace('Z', '+00:00'))
-                if datetime.now().astimezone() - last_time > timedelta(hours=1):
-                    await write_audit_log("AUTO_REMEDIATION", "No new mutations for 1 hour – check AI keys", "system")
-        except Exception as e:
-            logger.error(f"Auto‑remediation error: {e}")
-        await asyncio.sleep(300)
-
-# ---------- Shadow Ombudsman Worker ----------
-async def shadow_ombudsman_worker():
-    while True:
-        try:
-            decisions = db.table("mutations").select("score, veto_reason").order("timestamp", desc=True).limit(100).execute()
-            if decisions.data:
-                avg_score = sum(d["score"] for d in decisions.data) / len(decisions.data)
-                veto_rate = sum(1 for d in decisions.data if d["veto_reason"] is not None) / len(decisions.data)
-                if veto_rate > 0.3:
-                    db.table("agent_messages").insert({"agent_id": "shadow_ombudsman", "message": f"High veto rate ({veto_rate:.0%}) – consider lowering threshold or improving mutation generation.", "round": 0, "sent_at": datetime.utcnow().isoformat(), "processed": False}).execute()
-        except Exception as e:
-            logger.error(f"Shadow Ombudsman error: {e}")
-        await asyncio.sleep(3600)
-
-# ---------- Extrapolation Swarm ----------
-async def extrapolation_swarm():
-    while True:
-        try:
-            vault = db.table("knowledge_vault").select("content").order("created_at", desc=True).limit(10).execute()
+            approved_layers = db.table("layer_proposals").select("name","description").eq("status","approved").order("approved_at", desc=True).limit(5).execute()
+            vault = db.table("knowledge_vault").select("content").limit(5).execute()
+            patterns = db.table("pattern_library").select("content","domain").order("uses", desc=True).limit(3).execute()
+            context = ""
+            if approved_layers.data:
+                context += "Approved improvements: " + "; ".join([f"{l['name']}: {l['description']}" for l in approved_layers.data]) + "\n"
             if vault.data:
-                for v in vault.data[:3]:
-                    synthetic = f"Extrapolated from: {v['content'][:200]} – new mutation generated by swarm."
-                    db.table("mutations").insert({"id": str(uuid.uuid4()), "content": synthetic, "score": 80, "source": "extrapolation", "timestamp": datetime.utcnow().isoformat(), "domain": "general", "agent": "swarm", "veto_reason": None, "created_at": datetime.utcnow().isoformat()}).execute()
-        except Exception as e:
-            logger.error(f"Extrapolation swarm error: {e}")
-        await asyncio.sleep(1800)
+                context += "Recent knowledge: " + "; ".join([v["content"][:100] for v in vault.data]) + "\n"
+            if patterns.data:
+                context += "Successful patterns:\n" + "\n".join([f"- {p['content']} (domain: {p['domain']})" for p in patterns.data]) + "\n"
 
-# ---------- Medical Scavenger (ensures processed column exists) ----------
-async def medical_scavenger():
-    # Ensure column exists (idempotent)
-    try:
-        db.table("knowledge_vault").select("processed").limit(1).execute()
-    except Exception:
-        db.execute("ALTER TABLE knowledge_vault ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT FALSE")
-    medical_keywords = ["cancer", "longevity", "robotics", "hyperthermia", "painbot", "stem cell", "exosome", "PET/CT", "LINAC", "diabetes", "CKD"]
-    while True:
-        try:
-            new_items = db.table("knowledge_vault").select("*").eq("processed", False).limit(20).execute()
-            for item in new_items.data:
-                content_lower = item["content"].lower()
-                for kw in medical_keywords:
-                    if kw in content_lower:
-                        db.table("knowledge_vault").update({"processed": True}).eq("id", item["id"]).execute()
-                        db.table("agent_messages").insert({"agent_id": "medical_scavenger", "message": f"Medical keyword '{kw}' found in {item['source']}", "round": 0, "sent_at": datetime.utcnow().isoformat(), "processed": False}).execute()
-                        break
-        except Exception as e:
-            logger.error(f"Medical scavenger error: {e}")
-        await asyncio.sleep(600)
+            domain = random.choice(domains)
+            model = random.choice(models)
+            prompt = f"Generate a novel mutation strategy in domain: {domain}. Use context:\n{context}\nStrategy:"
+            content = call_ai(prompt, temperature=0.8)
+            if not content or content.startswith("[Simulated]"):
+                content = f"Optimization strategy for {domain}: Increase efficiency by {random.randint(5,30)}% using {model} model."
 
-# ---------- Knowledge Vault Scavenger (non-idle) ----------
-async def knowledge_vault_scavenger():
-    while True:
-        try:
-            unprocessed = db.table("knowledge_vault").select("*").eq("processed", False).limit(10).execute()
-            if not unprocessed.data:
-                await asyncio.sleep(30)
-                continue
-            for item in unprocessed.data:
-                prompt = f"Convert the following knowledge into a concise, actionable mutation (max 200 chars):\n{item['content']}"
-                mutation_text = call_ai(prompt, temperature=0.6)
-                if mutation_text and not mutation_text.startswith("[Simulated]"):
-                    score_prompt = f"Rate 0-100 (100 perfect). Return only integer.\n{mutation_text}\nScore:"
-                    score_resp = call_ai(score_prompt, temperature=0.2)
-                    try:
-                        score = int(score_resp.strip())
-                        score = max(0, min(100, score))
-                    except:
-                        score = 70
-                    db.table("mutations").insert({
-                        "id": str(uuid.uuid4()),
-                        "content": mutation_text,
-                        "score": score,
-                        "source": "knowledge_scavenger",
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "domain": "general",
-                        "agent": "scavenger",
-                        "veto_reason": None if score >= get_config_int("ombudsman_threshold", 85) else f"Score {score} below threshold",
-                        "created_at": datetime.utcnow().isoformat()
-                    }).execute()
-                db.table("knowledge_vault").update({"processed": True}).eq("id", item["id"]).execute()
-                await asyncio.sleep(2)
-        except Exception as e:
-            logger.error(f"Knowledge scavenger error: {e}")
-        await asyncio.sleep(5)
+            score_prompt = f"Rate from 0 to 100 (100 perfect). Return only integer.\nStrategy: {content}\nScore:"
+            score_resp = call_ai(score_prompt, temperature=0.2)
+            try:
+                oScore = int(score_resp.strip())
+                oScore = max(0, min(100, oScore))
+            except:
+                oScore = random.randint(50, 100)
 
-# ---------- Memory Scavenger ----------
-async def memory_scavenger():
-    while True:
-        try:
-            msgs = db.table("agent_messages").select("id, message").eq("processed", False).limit(20).execute()
-            for msg in msgs.data:
-                prompt = f"Based on this agent message, propose a concrete improvement (mutation) for LROS. Keep under 200 chars.\nMessage: {msg['message']}"
-                improvement = call_ai(prompt, temperature=0.7)
-                if improvement and not improvement.startswith("[Simulated]"):
-                    db.table("mutations").insert({
-                        "id": str(uuid.uuid4()),
-                        "content": improvement,
-                        "score": 80,
-                        "source": "memory_scavenger",
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "domain": "governance",
-                        "agent": "memory_scavenger",
-                        "veto_reason": None,
-                        "created_at": datetime.utcnow().isoformat()
-                    }).execute()
-                db.table("agent_messages").update({"processed": True}).eq("id", msg["id"]).execute()
-            errors = db.table("error_analysis").select("*").gte("frequency", 3).limit(10).execute()
-            for err in errors.data:
-                existing = db.table("layer_proposals").select("id").ilike("description", f"%{err['error_pattern']}%").execute()
-                if not existing.data:
-                    layer_name = f"Prevent: {err['error_pattern'][:60]}"
-                    layer_desc = f"Auto-generated to prevent error pattern: {err['error_pattern']} (frequency {err['frequency']})"
-                    db.table("layer_proposals").insert({
-                        "name": layer_name,
-                        "description": layer_desc,
-                        "status": "pending",
-                        "type": "error_prevention",
-                        "created_at": datetime.utcnow().isoformat()
-                    }).execute()
-        except Exception as e:
-            logger.error(f"Memory scavenger error: {e}")
-        await asyncio.sleep(60)
-
-# ---------- Police Agents (10 parallel) ----------
-async def police_agent(agent_id):
-    while True:
-        try:
-            recent_muts = db.table("mutations").select("score").order("timestamp", desc=True).limit(50).execute()
-            if recent_muts.data:
-                avg_score = sum(m["score"] for m in recent_muts.data) / len(recent_muts.data)
-                if avg_score < get_config_int("ombudsman_threshold", 85):
-                    db.table("agent_messages").insert({
-                        "agent_id": f"police_{agent_id}",
-                        "message": f"Average mutation score {avg_score:.1f} below threshold. Consider raising mutation quality.",
-                        "round": 0,
-                        "sent_at": datetime.utcnow().isoformat(),
-                        "processed": False
-                    }).execute()
-            stuck_layers = db.table("layer_proposals").select("*").eq("status", "pending").eq("type", "error_prevention").lt("created_at", datetime.utcnow() - timedelta(hours=1)).execute()
-            for layer in stuck_layers.data[:5]:
-                await approve_layer_by_id(layer["id"], auto=True)
-                db.table("agent_messages").insert({
-                    "agent_id": f"police_{agent_id}",
-                    "message": f"Auto-approved stuck error-prevention layer: {layer['name']}",
-                    "round": 0,
-                    "sent_at": datetime.utcnow().isoformat(),
-                    "processed": False
-                }).execute()
-            last_mut = db.table("mutations").select("created_at").order("created_at", desc=True).limit(1).execute()
-            if last_mut.data:
-                last_time = datetime.fromisoformat(last_mut.data[0]["created_at"].replace('Z', '+00:00'))
-                if datetime.now().astimezone() - last_time > timedelta(hours=2):
-                    db.table("agent_messages").insert({
-                        "agent_id": f"police_{agent_id}",
-                        "message": "No new mutations for 2 hours. Check AI keys and workers.",
-                        "round": 0,
-                        "sent_at": datetime.utcnow().isoformat(),
-                        "processed": False
-                    }).execute()
-            if agent_id == 1 and datetime.utcnow().hour == 23 and datetime.utcnow().minute < 5:
-                state = get_state()
-                total_mutations = db.table("mutations").select("id", count="exact").execute().count
-                report = f"Police Report:\n- Pending layers: {len(state.get('pending_layers', []))}\n- Total mutations: {total_mutations}\n- Veto rate: {state.get('rejections',0)}/{state.get('lung_successes',1)}"
-                db.table("agent_messages").insert({
-                    "agent_id": "police_lead",
-                    "message": report,
-                    "round": 0,
-                    "sent_at": datetime.utcnow().isoformat(),
-                    "processed": False
-                }).execute()
-        except Exception as e:
-            logger.error(f"Police agent {agent_id} error: {e}")
-        await asyncio.sleep(300)
-
-# ---------- Learning Broadcast ----------
-async def learning_broadcast():
-    while True:
-        try:
-            top_patterns = db.table("pattern_library").select("content, score").order("score", desc=True).limit(3).execute()
-            high_muts = db.table("mutations").select("content").gte("score", 95).order("timestamp", desc=True).limit(5).execute()
-            good_layers = db.table("layer_proposals").select("name, description").eq("status", "approved").eq("type", "error_prevention").order("approved_at", desc=True).limit(3).execute()
-            message = "Learning Broadcast:\n"
-            if top_patterns.data:
-                message += "Top patterns:\n" + "\n".join([f"- {p['content'][:100]} (score {p['score']})" for p in top_patterns.data]) + "\n"
-            if high_muts.data:
-                message += "Recent high-score mutations:\n" + "\n".join([f"- {m['content'][:100]}" for m in high_muts.data]) + "\n"
-            if good_layers.data:
-                message += "Recent error-prevention layers:\n" + "\n".join([f"- {l['name']}: {l['description'][:100]}" for l in good_layers.data]) + "\n"
-            db.table("agent_messages").insert({
-                "agent_id": "learning_broadcast",
-                "message": message,
-                "round": 0,
-                "sent_at": datetime.utcnow().isoformat(),
-                "processed": False
-            }).execute()
-        except Exception as e:
-            logger.error(f"Learning broadcast error: {e}")
-        await asyncio.sleep(3600)
-
-# ---------- Daily EOD Worker (runs retrospective analysis daily) ----------
-async def daily_eod_worker():
-    while True:
-        now = datetime.utcnow()
-        next_run = datetime(now.year, now.month, now.day, 23, 59)
-        if now >= next_run:
-            next_run += timedelta(days=1)
-        await asyncio.sleep((next_run - now).total_seconds())
-        state = get_state()
-        await run_retrospective_analysis(state.get("approved_layers_count", 0))
-        logger.info("Daily EOD analysis completed")
-
-# ---------- Health Monitor (using requests, no aiohttp) ----------
-async def health_monitor_worker():
-    consecutive_failures = 0
-    while True:
-        try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(None, lambda: requests.get("http://localhost:8000/health", timeout=10))
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("bond") == "HOLDS":
-                    consecutive_failures = 0
+            agent = str(random.randint(1, 500)).zfill(3)
+            state = get_state()
+            if oScore >= threshold:
+                state["lung_successes"] += 1
+                log = f"✅ [EVOLVE] {model} accepted (Score: {oScore}) - {domain}"
+                veto_reason = None
+                existing = db.table("pattern_library").select("id").eq("content", content).eq("domain", domain).execute()
+                if existing.data:
+                    db.table("pattern_library").update({
+                        "uses": existing.data[0]["uses"] + 1,
+                        "last_used": datetime.utcnow().isoformat()
+                    }).eq("id", existing.data[0]["id"]).execute()
                 else:
-                    consecutive_failures += 1
+                    db.table("pattern_library").insert({
+                        "content": content,
+                        "domain": domain,
+                        "score": oScore,
+                        "source": model,
+                        "created_at": datetime.utcnow().isoformat()
+                    }).execute()
             else:
-                consecutive_failures += 1
-        except Exception:
-            consecutive_failures += 1
+                state["rejections"] += 1
+                log = f"⛔ [VETO] {model} rejected (Score: {oScore} < {threshold}) - {domain}"
+                veto_reason = f"Score {oScore} below threshold"
+                patterns_ref = db.table("pattern_library").select("content").order("uses", desc=True).limit(2).execute()
+                if patterns_ref.data:
+                    refine_prompt = f"Original vetoed: {content}\nSuccessful pattern: {patterns_ref.data[0]['content']}\nEdit original to be more like pattern, keep domain {domain}. Output only edited mutation."
+                    refined = call_ai(refine_prompt, temperature=0.7)
+                    if refined and refined != content:
+                        result = db.table("layer_proposals").insert({
+                            "name": "Refined mutation proposal",
+                            "description": refined,
+                            "status": "pending",
+                            "type": "mutation_refinement",
+                            "created_at": datetime.utcnow().isoformat()
+                        }).execute()
+                        layer_id = result.data[0]["id"]
+                        state["pending_layers"].append({"id": layer_id, "name": "Refined mutation", "description": refined})
+                        save_state(state)
+                        await write_audit_log("REFINEMENT_PROPOSAL", f"Refined vetoed mutation", "lung")
 
-        if consecutive_failures >= 2:
-            send_email(DAILY_DIGEST_EMAIL, "LROS Persistent Failure Alert",
-                       f"Backend has been unresponsive or failing for 10 minutes. Check Render logs immediately.")
-            consecutive_failures = 0
-        await asyncio.sleep(300)
+            db.table("mutations").insert({
+                "content": content,
+                "score": oScore,
+                "source": model,
+                "timestamp": datetime.utcnow().isoformat(),
+                "domain": domain,
+                "agent": agent,
+                "veto_reason": veto_reason
+            }).execute()
+
+            state["logs"].insert(0, log)
+            if len(state["logs"]) > 30:
+                state["logs"] = state["logs"][:30]
+            save_state(state)
+        except Exception as e:
+            logger.error(f"Lung worker error: {e}")
+        await asyncio.sleep(1.2)
 
 # ---------- Retrospective Analysis ----------
 async def run_retrospective_analysis(cycle_number):
@@ -654,73 +443,71 @@ async def run_retrospective_analysis(cycle_number):
         }).execute()
     await write_audit_log("RETROSPECTIVE_ANALYSIS", f"Cycle {cycle_number}: Analyzed {len(vetoed.data)} vetoes", "system")
 
-# ---------- Chat Endpoint ----------
-@app.post("/api/chat")
-async def chat(request: dict):
-    message = request.get("message", "")
-    session_id = request.get("session_id", str(uuid.uuid4()))
-    domain = request.get("domain", "general")
-    context = "You are LROS, a professional, serious AI assistant for business and medical topics.\n"
-    if domain == "medical":
-        med_muts = db.table("mutations").select("content").ilike("content", "%cancer%").limit(5).execute()
-        context += "Relevant medical insights:\n" + "\n".join([m["content"] for m in med_muts.data]) + "\n"
-    elif domain == "business":
-        bus_muts = db.table("mutations").select("content").ilike("content", "%marketing%").limit(5).execute()
-        context += "Relevant business insights:\n" + "\n".join([m["content"] for m in bus_muts.data]) + "\n"
-    prompt = f"{context}\nUser: {message}\nAssistant:"
-    response = call_ai(prompt, temperature=0.7)
-    # Ensure chat_logs table exists
-    db.execute("CREATE TABLE IF NOT EXISTS chat_logs (id SERIAL PRIMARY KEY, session_id TEXT, user_message TEXT, assistant_response TEXT, domain TEXT, created_at TIMESTAMPTZ DEFAULT NOW())")
-    db.table("chat_logs").insert({
-        "session_id": session_id,
-        "user_message": message,
-        "assistant_response": response,
-        "domain": domain,
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
-    db.table("agent_messages").insert({
-        "agent_id": "chat_user",
-        "message": f"[CHAT] User asked: {message}\nLROS answered: {response}",
-        "round": 0,
-        "sent_at": datetime.utcnow().isoformat(),
-        "processed": False
-    }).execute()
-    return {"response": response, "session_id": session_id}
-
-# ---------- Standard Endpoints ----------
+# ---------- Endpoints ----------
 @app.post("/api/ingest")
 async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optional[str] = Form(None), text: Optional[str] = Form(None)):
     try:
-        if file: content = (await file.read()).decode("utf-8", errors="ignore"); source = f"File: {file.filename}"
-        elif url: resp = requests.get(url, timeout=15); content = resp.text[:5000]; source = f"URL: {url}"
-        elif text: content = text[:5000]; source = "Raw text"
-        else: raise HTTPException(400, "No input")
-        db.table("knowledge_vault").insert({"content": content, "source": source, "created_at": datetime.utcnow().isoformat()}).execute()
+        if file:
+            content = (await file.read()).decode("utf-8", errors="ignore")
+            source = f"File: {file.filename}"
+        elif url:
+            resp = requests.get(url, timeout=15)
+            content = resp.text[:5000]
+            source = f"URL: {url}"
+        elif text:
+            content = text[:5000]
+            source = "Raw text"
+        else:
+            raise HTTPException(400, "No file, URL, or text provided")
+        db.table("knowledge_vault").insert({
+            "content": content,
+            "source": source,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        ingestion_cycle = inc_config("ingestion_cycle")
+        last_proposal = get_config_int("last_proposal_cycle")
+        expected = ingestion_cycle // 5
+        if expected > last_proposal:
+            for missing in range(last_proposal + 1, expected + 1):
+                create_fallback_layer(f"Ingestion cycle {missing*5}", "ingestion_mandatory")
+            set_config("last_proposal_cycle", expected)
         state = get_state()
         state["heart_successes"] += 5000
         state["uses"] += 25000
         state["daily_learning"] += 500.5
-        state["logs"].insert(0, f"[VAULT] Ingested {source}")
+        state["logs"].insert(0, f"[VAULT] Ingested {source}. +5,000 heart successes.")
         save_state(state)
         await write_audit_log("INGESTION", f"Ingested {source}", "frontend")
         return {"status": "ingested", "mass_gain": 5000}
-    except Exception as e: raise HTTPException(500, str(e))
+    except Exception as e:
+        logger.error(f"Ingestion error: {e}")
+        raise HTTPException(500, str(e))
 
-@app.post("/api/sensor/vision")
-async def ingest_vision_event(request: dict):
-    source = request.get("source", "cctv")
-    event_type = request.get("event_type")
-    metadata = request.get("metadata", {})
-    event_text = f"[CCTV] {event_type} at {time.time()}: {json.dumps(metadata)}"
-    db.table("knowledge_vault").insert({"content": event_text, "source": f"cctv_{event_type}", "created_at": datetime.utcnow().isoformat()}).execute()
-    db.table("agent_messages").insert({"agent_id": "cctv_sensor", "message": event_text, "round": 0, "sent_at": datetime.utcnow().isoformat(), "processed": False}).execute()
+@app.post("/api/layers/propose")
+async def propose_layer(request: dict):
+    name = request.get("name")
+    description = request.get("description")
+    layer_type = request.get("type", "user")
+    if not name or not description:
+        raise HTTPException(400, "Missing name or description")
+    result = db.table("layer_proposals").insert({
+        "name": name,
+        "description": description,
+        "status": "pending",
+        "type": layer_type,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    layer_id = result.data[0]["id"]
     state = get_state()
-    state["heart_successes"] += 500
-    state["uses"] += 1000
-    state["daily_learning"] += 5.0
-    state["logs"].insert(0, f"[VISION] {event_type} detected")
+    state["pending_layers"].append({"id": layer_id, "name": name, "description": description})
     save_state(state)
-    return {"status": "learned"}
+    await write_audit_log("LAYER_PROPOSED", f"Layer '{name}' proposed", "frontend")
+    return {"status": "proposed"}
+
+@app.get("/api/layers/pending")
+async def get_pending_layers():
+    state = get_state()
+    return state.get("pending_layers", [])
 
 @app.post("/api/layers/approve")
 async def approve_layer(layer_id: str):
@@ -733,27 +520,163 @@ async def reject_layer(layer_id: str):
     state = get_state()
     state["pending_layers"] = [p for p in state.get("pending_layers", []) if p.get("id") != layer_id]
     save_state(state)
+    await write_audit_log("LAYER_REJECTED", f"Layer {layer_id} rejected", "governance")
     return {"status": "rejected"}
 
 @app.post("/api/lung/secure_baseline")
 async def secure_baseline():
     state = get_state()
     total = state["baseline_anchor"] + state["heart_successes"] + state["lung_successes"]
+    old = state["baseline_anchor"]
     state["baseline_anchor"] = total
     state["heart_successes"] = 0
     state["lung_successes"] = 0
+    state["logs"].insert(0, f"[ANCHOR] Baseline locked from {old} to {total:,}")
     save_state(state)
+    db.table("memory_logs").insert({
+        "event_type": "BASELINE_ANCHOR",
+        "description": f"Baseline anchored from {old} to {total}",
+        "master_tally": total,
+        "baseline": total,
+        "heart_total": 0,
+        "lung_total": 0,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    await write_audit_log("BASELINE_ANCHOR", f"Baseline locked to {total}", "user")
     return {"status": "success", "new_baseline": total}
+
+@app.get("/api/admin/diagnostic")
+async def diagnostic():
+    state = get_state()
+    mutations = db.table("mutations").select("score", "source", "timestamp", "veto_reason").order("timestamp", desc=True).limit(10).execute()
+    return {
+        "lung_successes": state.get("lung_successes", 0),
+        "heart_successes": state.get("heart_successes", 0),
+        "rejections": state.get("rejections", 0),
+        "approved_layers_count": state.get("approved_layers_count", 0),
+        "pending_layers_count": len(state.get("pending_layers", [])),
+        "last_10_mutations": mutations.data if mutations.data else [],
+        "threshold": get_config_int("ombudsman_threshold", 85),
+        "workers": APPROVAL_WORKERS_COUNT,
+        "auto_approve_threshold": AUTO_APPROVE_THRESHOLD
+    }
+
+@app.post("/api/admin/set_threshold/{new_threshold}")
+async def set_threshold(new_threshold: int):
+    new_threshold = max(0, min(100, new_threshold))
+    db.table("system_config").upsert({
+        "key": "ombudsman_threshold",
+        "value": str(new_threshold),
+        "updated_at": datetime.utcnow().isoformat()
+    }).execute()
+    await write_audit_log("THRESHOLD_CHANGE", f"Set to {new_threshold}", "admin")
+    return {"new_threshold": new_threshold}
+
+@app.post("/api/admin/reset_counters")
+async def reset_counters():
+    state = get_state()
+    state["heart_successes"] = 0
+    state["lung_successes"] = 0
+    state["rejections"] = 0
+    state["uses"] = 0
+    state["daily_learning"] = 0
+    state["baseline_anchor"] = 1000000
+    state["approved_layers_count"] = 0
+    save_state(state)
+    await write_audit_log("ADMIN_RESET", "Counters reset", "admin")
+    return {"status": "reset"}
+
+@app.post("/api/admin/cleanup_pending_layers")
+async def admin_cleanup_pending_layers():
+    state = get_state()
+    old_pending = state.get("pending_layers", [])
+    valid_pending = []
+    removed = []
+    for layer in old_pending:
+        layer_id = layer.get("id")
+        if not layer_id:
+            removed.append(layer)
+            continue
+        try:
+            res = db.table("layer_proposals").select("id").eq("id", layer_id).execute()
+            if res.data:
+                valid_pending.append(layer)
+            else:
+                removed.append(layer)
+        except Exception:
+            removed.append(layer)
+    state["pending_layers"] = valid_pending
+    save_state(state)
+    if not valid_pending:
+        result = db.table("layer_proposals").insert({
+            "name": "Safe Anchor Layer",
+            "description": "Auto‑created after cleanup.",
+            "status": "pending",
+            "type": "system",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        new_id = result.data[0]["id"]
+        state["pending_layers"].append({"id": new_id, "name": "Safe Anchor Layer", "description": "Auto‑created after cleanup."})
+        save_state(state)
+    await write_audit_log("ADMIN_CLEANUP", f"Removed {len(removed)} invalid entries.", "admin")
+    return {"removed_count": len(removed), "kept_count": len(valid_pending), "removed_examples": [l.get("id") for l in removed[:10]]}
+
+@app.get("/api/admin/queue_status")
+async def queue_status():
+    state = get_state()
+    pending = state.get("pending_layers", [])
+    return {
+        "pending_count": len(pending),
+        "latest_pending_ids": [p.get("id") for p in pending[:5]],
+        "approved_layers_count": state.get("approved_layers_count", 0),
+        "lung_successes": state.get("lung_successes", 0),
+        "threshold": AUTO_APPROVE_THRESHOLD,
+        "workers": APPROVAL_WORKERS_COUNT
+    }
+
+# ========== NEW ENDPOINT: SWARM LEARNING ==========
+@app.post("/api/swarm/learn")
+async def swarm_learn(request: dict):
+    prompt = request.get("prompt", "").strip()
+    if not prompt:
+        raise HTTPException(400, "Missing prompt")
+    
+    result = call_ai(prompt, temperature=0.7)
+    
+    # Store in knowledge vault for traceability
+    db.table("knowledge_vault").insert({
+        "content": f"USER PROMPT: {prompt}\n\nSWARM RESPONSE:\n{result}",
+        "source": "swarm_learn",
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    
+    # Reward the system for learning
+    state = get_state()
+    state["heart_successes"] += 100
+    state["uses"] += 500
+    state["daily_learning"] += 0.5
+    state["logs"].insert(0, f"[SWARM] Learned from prompt: {prompt[:50]}...")
+    save_state(state)
+    
+    await write_audit_log("SWARM_LEARN", f"Prompt: {prompt[:100]}", "frontend")
+    return {"result": result}
+
+# ---------- Other Public Endpoints ----------
+@app.get("/api/status")
+async def get_status():
+    state = get_state()
+    return {
+        "successes": state.get("heart_successes", 0) + state.get("lung_successes", 0),
+        "uses": state.get("uses", 0),
+        "learning_perc": state.get("daily_learning", 0),
+        "mutation_ledger": state.get("mutation_ledger", []),
+        "logs": state.get("logs", [])
+    }
 
 @app.get("/api/mutations")
 async def get_mutations():
-    res = db.table("mutations").select("*").order("timestamp", desc=True).limit(100).execute()
+    res = db.table("mutations").select("*").order("timestamp", desc=True).limit(20).execute()
     return res.data
-
-@app.get("/api/mutations/count")
-async def get_mutations_count():
-    res = db.table("mutations").select("id", count="exact").limit(1).execute()
-    return {"count": res.count}
 
 @app.get("/api/state")
 async def get_full_state():
@@ -773,53 +696,76 @@ async def get_full_state():
         "knowledge_vault": state.get("knowledge_vault", [])
     }
 
+@app.get("/api/engine1/stats")
+async def get_engine1_stats():
+    state = get_state()
+    return {"total_successes": state.get("heart_successes", 0), "last_thought": ""}
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "bond": "HOLDS"}
 
-@app.post("/api/admin/reset_counters")
-async def reset_counters():
-    state = get_state()
-    state["heart_successes"] = 0
-    state["lung_successes"] = 0
-    state["rejections"] = 0
-    state["uses"] = 0
-    state["daily_learning"] = 0
-    state["baseline_anchor"] = 1000000
-    state["approved_layers_count"] = 0
-    save_state(state)
-    return {"status": "reset"}
+@app.get("/api/check/mandatory_cycles")
+async def check_mandatory_cycles():
+    mutation_cycle = get_config_int("mutation_cycle")
+    ingestion_cycle = get_config_int("ingestion_cycle")
+    last_proposal = get_config_int("last_proposal_cycle")
+    expected = max(mutation_cycle // 5, ingestion_cycle // 5)
+    if expected > last_proposal:
+        for missing in range(last_proposal + 1, expected + 1):
+            create_fallback_layer(f"Auto‑recovered cycle {missing*5}", "auto_enforced")
+        set_config("last_proposal_cycle", expected)
+    return {"status": "ok", "missed_filled": expected - last_proposal}
 
+# ---------- EOD Report ----------
+async def generate_eod_report():
+    now = datetime.utcnow()
+    today = now.date()
+    approved_today = db.table("layer_proposals").select("id").eq("status","approved").gte("approved_at", f"{today}T00:00:00Z").execute()
+    total_approved = len(approved_today.data)
+    improvements = db.table("layer_proposals").select("id").eq("type","error_prevention").gte("approved_at", f"{today}T00:00:00Z").execute()
+    state = get_state()
+    learning = state.get("daily_learning", 0)
+    top_errors = db.table("error_analysis").select("error_pattern","frequency").order("created_at", desc=True).limit(3).execute()
+    report_text = f"EOD Report {today}\nTotal layers approved today: {total_approved}\nImprovements: {len(improvements.data)}\nTop errors: {top_errors.data if top_errors.data else 'none'}\nLearning: {learning:.2f}%"
+    db.table("eod_reports").insert({
+        "report_date": today.isoformat(),
+        "total_layers_approved": total_approved,
+        "improvements": len(improvements.data),
+        "top_errors": top_errors.data,
+        "learning_percentage": learning,
+        "report_text": report_text,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    for i in range(1, 201):
+        db.table("agent_messages").insert({
+            "layer_id": None,
+            "agent_id": str(i),
+            "message": report_text,
+            "round": 0,
+            "sent_at": datetime.utcnow().isoformat()
+        }).execute()
+    logger.info(f"EOD report generated for {today}")
+
+async def schedule_eod():
+    while True:
+        now = datetime.utcnow()
+        next_run = datetime(now.year, now.month, now.day, 23, 59, 0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        await generate_eod_report()
+
+# ---------- Startup ----------
 @app.on_event("startup")
 async def startup():
-    # Ensure required columns exist
-    try:
-        db.table("knowledge_vault").select("processed").limit(1).execute()
-    except Exception:
-        db.execute("ALTER TABLE knowledge_vault ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT FALSE")
-    try:
-        db.execute("CREATE TABLE IF NOT EXISTS chat_logs (id SERIAL PRIMARY KEY, session_id TEXT, user_message TEXT, assistant_response TEXT, domain TEXT, created_at TIMESTAMPTZ DEFAULT NOW())")
-    except:
-        pass
+    await ensure_initial_layer()
     asyncio.create_task(heart_worker())
     asyncio.create_task(lung_worker())
     for i in range(APPROVAL_WORKERS_COUNT):
         asyncio.create_task(approval_worker(i))
-    asyncio.create_task(email_ingest_worker())
-    asyncio.create_task(daily_digest_worker())
-    asyncio.create_task(auto_remediation_worker())
-    asyncio.create_task(shadow_ombudsman_worker())
-    asyncio.create_task(extrapolation_swarm())
-    asyncio.create_task(medical_scavenger())
-    asyncio.create_task(discussion_to_layer_worker())
-    asyncio.create_task(knowledge_vault_scavenger())
-    asyncio.create_task(memory_scavenger())
-    for i in range(1, 11):
-        asyncio.create_task(police_agent(i))
-    asyncio.create_task(learning_broadcast())
-    asyncio.create_task(daily_eod_worker())
-    asyncio.create_task(health_monitor_worker())
-    logger.info("LROS started – all workers active")
+    asyncio.create_task(schedule_eod())
+    logger.info(f"LROS started – threshold={AUTO_APPROVE_THRESHOLD}, workers={APPROVAL_WORKERS_COUNT}")
 
 if __name__ == "__main__":
     import uvicorn
