@@ -1,5 +1,5 @@
 # ============================================================================
-# LROS FINAL – Complete, Error‑Free, All Workers + Police + Scavengers + Health Monitor
+# LROS FINAL – ERROR‑FREE, NO AIOHTTP, ALL WORKERS
 # ============================================================================
 import os
 import asyncio
@@ -19,7 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from typing import Optional
 import requests
-import aiohttp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Sovereign")
@@ -400,7 +399,7 @@ async def extrapolation_swarm():
             logger.error(f"Extrapolation swarm error: {e}")
         await asyncio.sleep(1800)
 
-# ---------- Medical Scavenger (fixed: ensure processed column exists) ----------
+# ---------- Medical Scavenger (ensures processed column exists) ----------
 async def medical_scavenger():
     # Ensure column exists (idempotent)
     try:
@@ -584,30 +583,31 @@ async def daily_eod_worker():
         await run_retrospective_analysis(state.get("approved_layers_count", 0))
         logger.info("Daily EOD analysis completed")
 
-# ---------- Health Monitor (internal) ----------
+# ---------- Health Monitor (using requests, no aiohttp) ----------
 async def health_monitor_worker():
     consecutive_failures = 0
     while True:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"http://localhost:8000/health", timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("bond") == "HOLDS":
-                            consecutive_failures = 0
-                        else:
-                            consecutive_failures += 1
-                    else:
-                        consecutive_failures += 1
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, lambda: requests.get("http://localhost:8000/health", timeout=10))
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("bond") == "HOLDS":
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+            else:
+                consecutive_failures += 1
         except Exception:
             consecutive_failures += 1
+
         if consecutive_failures >= 2:
             send_email(DAILY_DIGEST_EMAIL, "LROS Persistent Failure Alert",
                        f"Backend has been unresponsive or failing for 10 minutes. Check Render logs immediately.")
             consecutive_failures = 0
         await asyncio.sleep(300)
 
-# ---------- Retrospective Analysis (existing) ----------
+# ---------- Retrospective Analysis ----------
 async def run_retrospective_analysis(cycle_number):
     vetoed = db.table("mutations").select("content","score","veto_reason","domain").lt("score",85).order("timestamp", desc=True).limit(200).execute()
     if not vetoed.data:
@@ -669,7 +669,7 @@ async def chat(request: dict):
         context += "Relevant business insights:\n" + "\n".join([m["content"] for m in bus_muts.data]) + "\n"
     prompt = f"{context}\nUser: {message}\nAssistant:"
     response = call_ai(prompt, temperature=0.7)
-    # Ensure chat_logs table exists (run once)
+    # Ensure chat_logs table exists
     db.execute("CREATE TABLE IF NOT EXISTS chat_logs (id SERIAL PRIMARY KEY, session_id TEXT, user_message TEXT, assistant_response TEXT, domain TEXT, created_at TIMESTAMPTZ DEFAULT NOW())")
     db.table("chat_logs").insert({
         "session_id": session_id,
