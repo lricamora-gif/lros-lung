@@ -1,376 +1,330 @@
 import os
 import asyncio
-import uuid
+import random
 import logging
-from datetime import datetime
-from typing import Optional
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from supabase import create_client, Client
+from datetime import datetime, timedelta
+from supabase import create_client
 from dotenv import load_dotenv
 import httpx
 
 load_dotenv()
-
-# ------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("lros-backend")
+logger = logging.getLogger("lros-lung")
 
-# ------------------------------------------------------------------
-# Supabase Client
-# ------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # service role for writes
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.warning("Supabase credentials missing – database features disabled")
-    supabase = None
-else:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise Exception("Missing Supabase credentials")
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# ------------------------------------------------------------------
-# AI Configuration (Mistral first, then fallbacks)
-# ------------------------------------------------------------------
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+async def call_ai(prompt: str, timeout=120) -> str:
+    """Optional AI call – if key missing, returns None."""
+    if not MISTRAL_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "mistral-large-latest", "messages": [{"role": "user", "content": prompt}], "temperature": 0.8}
+            )
+            return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"AI call failed: {e}")
+        return None
 
 # ------------------------------------------------------------------
-# Pydantic Models
+# 1. Extrapolation Swarm (API‑free, runs every 30 min)
 # ------------------------------------------------------------------
-class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
-    domain: str = "general"
-
-class ChatResponse(BaseModel):
-    response: str
-    session_id: str
-
-# ------------------------------------------------------------------
-# AI Call Functions (Mistral primary, fallbacks)
-# ------------------------------------------------------------------
-async def call_mistral(prompt: str, temperature: float = 0.7) -> str:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.mistral.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "mistral-large-latest",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": temperature,
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-async def call_openai(prompt: str, temperature: float) -> str:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": prompt}], "temperature": temperature},
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-async def call_deepseek(prompt: str, temperature: float) -> str:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": temperature},
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-async def call_groq(prompt: str, temperature: float) -> str:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={"model": "mixtral-8x7b-32768", "messages": [{"role": "user", "content": prompt}], "temperature": temperature},
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-async def call_gemini(prompt: str, temperature: float) -> str:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}",
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-        )
-        resp.raise_for_status()
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-async def call_ai(prompt: str, temperature: float = 0.7) -> str:
-    """Try Mistral first, then fallback to others."""
-    if MISTRAL_API_KEY:
-        try:
-            return await call_mistral(prompt, temperature)
-        except Exception as e:
-            logger.error(f"Mistral failed: {e}")
-    if OPENAI_API_KEY:
-        try:
-            return await call_openai(prompt, temperature)
-        except Exception as e:
-            logger.error(f"OpenAI failed: {e}")
-    if DEEPSEEK_API_KEY:
-        try:
-            return await call_deepseek(prompt, temperature)
-        except Exception as e:
-            logger.error(f"DeepSeek failed: {e}")
-    if GROQ_API_KEY:
-        try:
-            return await call_groq(prompt, temperature)
-        except Exception as e:
-            logger.error(f"Groq failed: {e}")
-    if GEMINI_API_KEY:
-        try:
-            return await call_gemini(prompt, temperature)
-        except Exception as e:
-            logger.error(f"Gemini failed: {e}")
-    return "[MOCK] No AI key available. Please set MISTRAL_API_KEY or another provider."
+async def extrapolation_swarm():
+    """Rule‑based synthetic mutations from recent knowledge_vault entries."""
+    entries = supabase.table("knowledge_vault").select("content").order("created_at", desc=True).limit(10).execute()
+    if not entries.data:
+        return
+    for e in entries.data:
+        # Simple extrapolation: take first sentence, add "Implement in LROS."
+        first_sentence = e["content"].split(".")[0][:200]
+        synthetic = f"{first_sentence}. Implement this as a LROS capability."
+        supabase.table("mutations").insert({
+            "content": synthetic,
+            "source": "extrapolation_swarm",
+            "score": random.randint(60, 85),
+            "timestamp": datetime.utcnow().isoformat(),
+            "processed": False
+        }).execute()
+    logger.info("Extrapolation swarm generated synthetic mutations")
 
 # ------------------------------------------------------------------
-# Background Swarm Worker (Self‑Evolution)
+# 2. Knowledge Vault Scavenger (AI preferred, fallback to keyword)
 # ------------------------------------------------------------------
-async def swarm_worker():
-    """Periodically processes unprocessed agent_messages and mutations."""
-    while True:
-        await asyncio.sleep(60)  # Run every minute
-        if not supabase:
-            continue
-        try:
-            # 1. Process unprocessed agent messages
-            result = supabase.table("agent_messages").select("*").eq("processed", False).limit(5).execute()
-            for msg in result.data:
-                logger.info(f"Swarm processing message {msg['id']} from {msg['agent_id']}")
-                prompt = f"You are LROS swarm. Respond helpfully to: {msg['message']}"
-                response = await call_ai(prompt, temperature=0.6)
-                # Store response
-                supabase.table("agent_messages").insert({
-                    "agent_id": "swarm_worker",
-                    "message": f"RESPONSE: {response}",
-                    "round": msg.get("round", 0) + 1,
-                    "sent_at": datetime.utcnow().isoformat(),
-                    "processed": False
-                }).execute()
-                supabase.table("agent_messages").update({"processed": True}).eq("id", msg["id"]).execute()
-                # Audit log
-                supabase.table("audit_log").insert({
-                    "event_type": "swarm_response",
-                    "description": f"Responded to {msg['agent_id']}",
-                    "source": "swarm_worker",
-                    "created_at": datetime.utcnow().isoformat()
-                }).execute()
-
-            # 2. Process high‑score mutations (auto layer proposals)
-            muts = supabase.table("mutations").select("*").eq("processed", False).execute()
-            for mut in muts.data:
-                if mut.get("score", 0) >= 70:
-                    supabase.table("layer_proposals").insert({
-                        "name": f"Auto-{mut['id'][:8]}",
-                        "description": mut["content"],
-                        "status": "pending",
-                        "type": "mutation"
-                    }).execute()
-                supabase.table("mutations").update({"processed": True}).eq("id", mut["id"]).execute()
-        except Exception as e:
-            logger.error(f"Swarm worker error: {e}")
+async def knowledge_vault_scavenger():
+    entries = supabase.table("knowledge_vault").select("*").eq("processed", False).limit(5).execute()
+    for entry in entries.data:
+        mutation_text = None
+        if MISTRAL_API_KEY:
+            prompt = f"Convert the following knowledge into a specific, actionable mutation:\n\n{entry['content']}\n\nMutation:"
+            mutation_text = await call_ai(prompt)
+        if not mutation_text:
+            # Fallback: extract first 100 chars as mutation
+            mutation_text = f"From {entry['source']}: {entry['content'][:150]}..."
+        supabase.table("mutations").insert({
+            "content": mutation_text,
+            "source": f"knowledge_vault:{entry['source']}",
+            "score": 0,
+            "timestamp": datetime.utcnow().isoformat(),
+            "processed": False
+        }).execute()
+        supabase.table("knowledge_vault").update({"processed": True}).eq("id", entry["id"]).execute()
+        # Create agent message
+        supabase.table("agent_messages").insert({
+            "agent_id": "knowledge_scavenger",
+            "message": f"New mutation from {entry['source']}: {mutation_text[:200]}",
+            "sent_at": datetime.utcnow().isoformat(),
+            "processed": False
+        }).execute()
+    if entries.data:
+        logger.info(f"Processed {len(entries.data)} knowledge vault entries")
 
 # ------------------------------------------------------------------
-# FastAPI App with Lifespan
+# 3. Memory Scavenger (agent_messages + error patterns)
 # ------------------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Start background swarm worker
-    asyncio.create_task(swarm_worker())
-    logger.info("LROS backend started with swarm worker")
-    yield
-    # Cleanup if needed
-
-app = FastAPI(title="LROS Chat API", version="3.0", lifespan=lifespan)
-
-# ========== CORS: wildcard allowed only with credentials=False ==========
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+async def memory_scavenger():
+    msgs = supabase.table("agent_messages").select("*").eq("processed", False).limit(10).execute()
+    for msg in msgs.data:
+        correction = None
+        if MISTRAL_API_KEY:
+            prompt = f"Analyze this message and suggest a corrective mutation:\n\n{msg['message']}\n\nMutation:"
+            correction = await call_ai(prompt)
+        if not correction:
+            correction = f"Memory scavenger suggests addressing: {msg['message'][:100]}"
+        supabase.table("mutations").insert({
+            "content": correction,
+            "source": f"memory_scavenger:msg_{msg['id']}",
+            "score": 0,
+            "timestamp": datetime.utcnow().isoformat(),
+            "processed": False
+        }).execute()
+        supabase.table("agent_messages").update({"processed": True}).eq("id", msg["id"]).execute()
+    if msgs.data:
+        logger.info(f"Processed {len(msgs.data)} agent messages")
 
 # ------------------------------------------------------------------
-# Chat Endpoint
+# 4. Medical Scavenger (API‑free, keyword tagging)
 # ------------------------------------------------------------------
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(req: ChatRequest):
-    session_id = req.session_id or str(uuid.uuid4())
-    domain = req.domain.lower()
-    system_prompt = (
-        "You are LROS, a professional, serious, constitutional AI assistant. "
-        "Answer business and medical questions with precision. Be safe and truthful.\n\n"
-    )
-    # Optional: fetch context from mutations (simplified)
-    if supabase and domain in ["business", "medical"]:
-        try:
-            kw = "marketing" if domain == "business" else "patient"
-            context = supabase.table("mutations").select("content").ilike("content", f"%{kw}%").limit(3).execute()
-            if context.data:
-                system_prompt += "Relevant LROS intelligence:\n" + "\n".join([c["content"] for c in context.data]) + "\n\n"
-        except Exception as e:
-            logger.error(f"Context fetch error: {e}")
-    full_prompt = f"{system_prompt}User: {req.message}\nAssistant:"
-    response_text = await call_ai(full_prompt, temperature=0.7)
-    # Store in chat_logs and agent_messages
-    if supabase:
-        try:
-            supabase.table("chat_logs").insert({
-                "session_id": session_id,
-                "user_message": req.message,
-                "assistant_response": response_text,
-                "domain": domain,
-                "created_at": datetime.utcnow().isoformat()
-            }).execute()
+async def medical_scavenger():
+    keywords = ["cancer", "therapy", "patient", "clinical", "hyperthermia", "longevity", "CAR-T", "oncology", "health"]
+    entries = supabase.table("knowledge_vault").select("*").eq("processed", True).order("created_at", desc=True).limit(20).execute()
+    for entry in entries.data:
+        content_lower = entry["content"].lower()
+        if any(kw in content_lower for kw in keywords):
             supabase.table("agent_messages").insert({
-                "agent_id": "chat_user",
-                "message": f"User asked: {req.message}\nLROS answered: {response_text}",
-                "round": 0,
+                "agent_id": "medical_scavenger",
+                "message": f"MEDICAL TAG: {entry['source']}\n{entry['content'][:500]}",
                 "sent_at": datetime.utcnow().isoformat(),
                 "processed": False
             }).execute()
+
+# ------------------------------------------------------------------
+# 5. Ombudsman Scoring & Veto (API‑free, rule‑based)
+# ------------------------------------------------------------------
+async def ombudsman_score():
+    mutations = supabase.table("mutations").select("*").eq("processed", False).execute()
+    threshold = 70  # can be read from system_config
+    for mut in mutations.data:
+        # Simple scoring: length bonus, keyword bonus
+        score = 50
+        if len(mut["content"]) > 50:
+            score += 20
+        if any(word in mut["content"].lower() for word in ["safety", "patient", "protocol", "improve"]):
+            score += 15
+        score = min(100, score)
+        veto_reason = None
+        if score < threshold:
+            veto_reason = f"Score {score} below threshold {threshold}"
+            supabase.table("error_analysis").insert({
+                "error_pattern": veto_reason,
+                "frequency": 1,
+                "created_at": datetime.utcnow().isoformat()
+            }).execute()
+        supabase.table("mutations").update({
+            "score": score,
+            "veto_reason": veto_reason,
+            "processed": True
+        }).eq("id", mut["id"]).execute()
+        # Agent message about outcome
+        status = "ACCEPTED" if score >= threshold else "VETOED"
+        supabase.table("agent_messages").insert({
+            "agent_id": "ombudsman",
+            "message": f"Mutation {mut['id'][:8]} scored {score} – {status}",
+            "sent_at": datetime.utcnow().isoformat(),
+            "processed": False
+        }).execute()
+        # Update lung successes/rejections in sovereign_state
+        state = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
+        if state.data:
+            d = state.data[0]["state_data"]
+            if score >= threshold:
+                d["lung_successes"] = d.get("lung_successes", 0) + 1
+            else:
+                d["rejections"] = d.get("rejections", 0) + 1
+            supabase.table("sovereign_state").update({"state_data": d}).eq("id", 1).execute()
+    if mutations.data:
+        logger.info(f"Scored {len(mutations.data)} mutations")
+
+# ------------------------------------------------------------------
+# 6. Retrospective Analysis (AI preferred, fallback to template)
+# ------------------------------------------------------------------
+async def retrospective_analysis():
+    last_run = supabase.table("system_config").select("value").eq("key", "last_retrospective").execute()
+    last_date = last_run.data[0]["value"] if last_run.data else "2000-01-01"
+    if datetime.utcnow() - datetime.fromisoformat(last_date) < timedelta(days=1):
+        return
+    week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    errors = supabase.table("error_analysis").select("error_pattern").gte("created_at", week_ago).execute()
+    if not errors.data:
+        return
+    patterns = list(set([e["error_pattern"] for e in errors.data]))
+    layers_text = None
+    if MISTRAL_API_KEY:
+        prompt = f"Based on these error patterns, generate 5 new constitutional layers:\n" + "\n".join(patterns[:10])
+        layers_text = await call_ai(prompt)
+    if not layers_text:
+        layers_text = "\n".join([f"Layer to prevent: {p}" for p in patterns[:5]])
+    for line in layers_text.split("\n"):
+        if line.strip():
+            supabase.table("layer_proposals").insert({
+                "name": f"Retro-{datetime.utcnow().strftime('%Y%m%d')}",
+                "description": line[:200],
+                "status": "pending",
+                "type": "retrospective"
+            }).execute()
+    supabase.table("system_config").upsert({"key": "last_retrospective", "value": datetime.utcnow().isoformat()}).execute()
+    logger.info("Retrospective analysis completed")
+
+# ------------------------------------------------------------------
+# 7. Discussion‑to‑Layer Worker
+# ------------------------------------------------------------------
+async def discussion_to_layer():
+    msgs = supabase.table("agent_messages").select("*").eq("processed", False).limit(5).execute()
+    for msg in msgs.data:
+        layer_desc = None
+        if MISTRAL_API_KEY:
+            prompt = f"Convert this discussion into a constitutional layer:\n\n{msg['message']}\n\nLayer:"
+            layer_desc = await call_ai(prompt)
+        if not layer_desc:
+            layer_desc = f"Layer from discussion: {msg['message'][:100]}"
+        supabase.table("layer_proposals").insert({
+            "name": f"Discuss-{msg['id']}",
+            "description": layer_desc,
+            "status": "pending",
+            "type": "discussion"
+        }).execute()
+        supabase.table("agent_messages").update({"processed": True}).eq("id", msg["id"]).execute()
+    if msgs.data:
+        logger.info(f"Discussion-to-layer processed {len(msgs.data)} messages")
+
+# ------------------------------------------------------------------
+# 8. Police Agents (anomaly detection, auto‑remediation)
+# ------------------------------------------------------------------
+async def police_agent():
+    # Check for stuck pending layers (> 1 hour)
+    hour_ago = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    stuck = supabase.table("layer_proposals").select("*").eq("status", "pending").lt("created_at", hour_ago).execute()
+    if stuck.data:
+        logger.warning(f"Auto-approving {len(stuck.data)} stuck layers")
+        for layer in stuck.data:
+            supabase.table("layer_proposals").update({"status": "approved", "approved_at": datetime.utcnow().isoformat()}).eq("id", layer["id"]).execute()
+    # Check for no new mutations in last 30 minutes
+    thirty_ago = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
+    recent = supabase.table("mutations").select("id").gte("timestamp", thirty_ago).limit(1).execute()
+    if not recent.data:
+        logger.warning("No new mutations in 30 min – triggering emergency extrapolation")
+        await extrapolation_swarm()  # force run
+    # Check veto rate
+    state = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    if state.data:
+        d = state.data[0]["state_data"]
+        rejections = d.get("rejections", 0)
+        successes = d.get("lung_successes", 0)
+        if rejections > successes * 2 and successes > 10:
+            alert = f"High veto rate: {rejections} vs {successes}"
+            supabase.table("agent_messages").insert({
+                "agent_id": "police",
+                "message": alert,
+                "sent_at": datetime.utcnow().isoformat(),
+                "processed": False
+            }).execute()
+            logger.warning(alert)
+
+# ------------------------------------------------------------------
+# 9. Auto‑Approve Layers (by backlog threshold)
+# ------------------------------------------------------------------
+async def auto_approve_layers():
+    pending = supabase.table("layer_proposals").select("*").eq("status", "pending").execute()
+    if len(pending.data) >= 5:
+        for layer in pending.data:
+            supabase.table("layer_proposals").update({"status": "approved", "approved_at": datetime.utcnow().isoformat()}).eq("id", layer["id"]).execute()
+        logger.info(f"Auto-approved {len(pending.data)} layers")
+
+# ------------------------------------------------------------------
+# 10. Daily Digest
+# ------------------------------------------------------------------
+async def daily_digest():
+    last_digest = supabase.table("system_config").select("value").eq("key", "last_digest").execute()
+    last_date = last_digest.data[0]["value"] if last_digest.data else "2000-01-01"
+    if datetime.utcnow() - datetime.fromisoformat(last_date) < timedelta(days=1):
+        return
+    state = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
+    if state.data:
+        d = state.data[0]["state_data"]
+        total = d.get("baseline_anchor", 0) + d.get("heart_successes", 0) + d.get("lung_successes", 0)
+        summary = f"Daily: Total {total}, Heart +{d.get('heart_successes',0)}, Lung +{d.get('lung_successes',0)}, Rejections {d.get('rejections',0)}"
+        supabase.table("audit_log").insert({
+            "event_type": "daily_digest",
+            "description": summary,
+            "source": "lung_worker",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        supabase.table("agent_messages").insert({
+            "agent_id": "digest",
+            "message": summary,
+            "sent_at": datetime.utcnow().isoformat(),
+            "processed": False
+        }).execute()
+    supabase.table("system_config").upsert({"key": "last_digest", "value": datetime.utcnow().isoformat()}).execute()
+
+# ------------------------------------------------------------------
+# Main Loop – Coordinated, Efficient
+# ------------------------------------------------------------------
+async def main_loop():
+    # Ensure config defaults
+    supabase.table("system_config").upsert({"key": "last_retrospective", "value": "2000-01-01"}).execute()
+    supabase.table("system_config").upsert({"key": "last_digest", "value": "2000-01-01"}).execute()
+
+    while True:
+        try:
+            # Run every 30 seconds
+            await knowledge_vault_scavenger()
+            await memory_scavenger()
+            await ombudsman_score()
+            await police_agent()
+            await auto_approve_layers()
+
+            # Run every 5 minutes (based on minute)
+            if datetime.utcnow().minute % 5 == 0:
+                await medical_scavenger()
+                await extrapolation_swarm()
+                await discussion_to_layer()
+
+            # Run daily tasks
+            await retrospective_analysis()
+            await daily_digest()
+
         except Exception as e:
-            logger.error(f"DB insert error: {e}")
-    return ChatResponse(response=response_text, session_id=session_id)
+            logger.error(f"Lung worker error: {e}")
+        await asyncio.sleep(30)
 
-# ------------------------------------------------------------------
-# Additional API Endpoints for Dashboard
-# ------------------------------------------------------------------
-@app.get("/api/state")
-async def get_state():
-    if not supabase:
-        return {"error": "Supabase not configured"}
-    res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
-    if not res.data:
-        return {}
-    return res.data[0]["state_data"]
-
-@app.get("/api/mutations")
-async def get_mutations(limit: int = 100):
-    if not supabase:
-        return []
-    res = supabase.table("mutations").select("*").order("timestamp", desc=True).limit(limit).execute()
-    return res.data
-
-@app.get("/api/mutations/count")
-async def get_mutations_count():
-    if not supabase:
-        return {"count": 0}
-    res = supabase.table("mutations").select("id", count="exact").execute()
-    return {"count": res.count}
-
-@app.post("/api/layers/approve")
-async def approve_layer(layer_id: str):
-    if not supabase:
-        raise HTTPException(500, "Supabase not configured")
-    # Check if exists
-    check = supabase.table("layer_proposals").select("id").eq("id", layer_id).execute()
-    if not check.data:
-        raise HTTPException(404, "Layer not found")
-    supabase.table("layer_proposals").update({"status": "approved", "approved_at": datetime.utcnow().isoformat()}).eq("id", layer_id).execute()
-    # Update sovereign_state: remove from pending_layers and increment approved count
-    state_res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
-    if state_res.data:
-        state = state_res.data[0]["state_data"]
-        pending = state.get("pending_layers", [])
-        new_pending = [p for p in pending if p.get("id") != layer_id]
-        state["pending_layers"] = new_pending
-        state["approved_layers_count"] = state.get("approved_layers_count", 0) + 1
-        state["daily_learning"] = state.get("daily_learning", 0) + 0.1
-        supabase.table("sovereign_state").update({"state_data": state}).eq("id", 1).execute()
-    return {"status": "approved"}
-
-@app.post("/api/layers/reject")
-async def reject_layer(layer_id: str):
-    if not supabase:
-        raise HTTPException(500, "Supabase not configured")
-    supabase.table("layer_proposals").update({"status": "rejected"}).eq("id", layer_id).execute()
-    # Remove from pending_layers
-    state_res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
-    if state_res.data:
-        state = state_res.data[0]["state_data"]
-        pending = state.get("pending_layers", [])
-        new_pending = [p for p in pending if p.get("id") != layer_id]
-        state["pending_layers"] = new_pending
-        supabase.table("sovereign_state").update({"state_data": state}).eq("id", 1).execute()
-    return {"status": "rejected"}
-
-@app.post("/api/lung/secure_baseline")
-async def secure_baseline():
-    if not supabase:
-        raise HTTPException(500, "Supabase not configured")
-    state_res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
-    if not state_res.data:
-        raise HTTPException(404, "State not found")
-    state = state_res.data[0]["state_data"]
-    total = state.get("baseline_anchor", 0) + state.get("heart_successes", 0) + state.get("lung_successes", 0)
-    old = state.get("baseline_anchor", 0)
-    state["baseline_anchor"] = total
-    state["heart_successes"] = 0
-    state["lung_successes"] = 0
-    supabase.table("sovereign_state").update({"state_data": state}).eq("id", 1).execute()
-    # Log to memory_logs
-    supabase.table("memory_logs").insert({
-        "event_type": "BASELINE_ANCHOR",
-        "description": f"Baseline anchored from {old} to {total}",
-        "master_tally": total,
-        "baseline": total,
-        "heart_total": 0,
-        "lung_total": 0,
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
-    return {"new_baseline": total}
-
-@app.post("/api/admin/reset_counters")
-async def reset_counters():
-    if not supabase:
-        raise HTTPException(500, "Supabase not configured")
-    state_res = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
-    if state_res.data:
-        state = state_res.data[0]["state_data"]
-        state["heart_successes"] = 0
-        state["lung_successes"] = 0
-        state["rejections"] = 0
-        state["uses"] = 0
-        state["daily_learning"] = 0
-        state["baseline_anchor"] = 1000000
-        state["approved_layers_count"] = 0
-        supabase.table("sovereign_state").update({"state_data": state}).eq("id", 1).execute()
-    return {"status": "reset"}
-
-@app.post("/api/ingest")
-async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optional[str] = Form(None), text: Optional[str] = Form(None)):
-    # Simplified for demo; in production you'd handle file uploads
-    return {"status": "ingested"}
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "bond": "HOLDS"}
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_chat():
-    # You'll serve index.html separately; but for completeness:
-    with open("index.html", "r") as f:
-        return HTMLResponse(content=f.read())
-
-# ------------------------------------------------------------------
-# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
-# ------------------------------------------------------------------
+if __name__ == "__main__":
+    asyncio.run(main_loop())
