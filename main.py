@@ -172,9 +172,9 @@ def watch_laptop_sensors():
 def watch_samsung_watch():
     """
     # Samsung watch data – requires companion app on phone to forward to this script.
-    For simplicity, we'll assume a local HTTP endpoint on the phone that pushes data.
-    You can replace with actual SDK integration.
-    """
+    # For simplicity, we'll assume a local HTTP endpoint on the phone that pushes data.
+    # You can replace with actual SDK integration.
+    # """
     # Placeholder: listen on a local port for watch data (e.g., from phone app)
     # In practice, you'd run a small HTTP server to receive POSTs from your phone.
     # We'll provide a simple HTTP listener.
