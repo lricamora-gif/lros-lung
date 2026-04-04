@@ -1,5 +1,5 @@
 # ============================================================================
-# LROS – Complete Integrated Backend (Projects 1,2,3) – STABLE + SWARM LEARN
+# LROS – Complete Backend (Render) – Bulletproof Edition
 # ============================================================================
 
 import os
@@ -19,9 +19,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LROS-Sovereign")
 
 app = FastAPI(title="LROS Sovereign Engine")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ---------- Supabase ----------
+# ========== CRITICAL CORS FIX ==========
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,      # MUST BE FALSE when allow_origins=["*"]
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# ---------- Supabase Initialization ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -97,30 +105,57 @@ async def ensure_initial_layer():
         save_state(state)
         await write_audit_log("SYSTEM_LAYER", "Created initial anchor layer", "system")
 
-# ---------- AI Caller (DeepSeek + Gemini fallback) ----------
+# ---------- AI Caller (Mistral Primary + DeepSeek/Gemini Fallbacks) ----------
+MISTRAL_API_KEYS = [k.strip() for k in os.environ.get("MISTRAL_API_KEYS", "").split(",") if k.strip()]
 DEEPSEEK_API_KEYS = [k.strip() for k in os.environ.get("DEEPSEEK_API_KEYS", "").split(",") if k.strip()]
 GEMINI_API_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEYS", "").split(",") if k.strip()]
+
+mistral_index = 0
 deepseek_index = 0
 gemini_index = 0
 
 def call_ai(prompt: str, temperature: float = 0.7) -> str:
-    global deepseek_index, gemini_index
+    global mistral_index, deepseek_index, gemini_index
+    
+    # 1. MISTRAL (Primary)
+    if MISTRAL_API_KEYS:
+        for _ in range(len(MISTRAL_API_KEYS)):
+            key = MISTRAL_API_KEYS[mistral_index % len(MISTRAL_API_KEYS)]
+            mistral_index += 1
+            try:
+                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+                payload = {
+                    "model": "mistral-large-latest",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature
+                }
+                response = requests.post("https://api.mistral.ai/v1/chat/completions", json=payload, headers=headers, timeout=30)
+                if response.ok:
+                    return response.json()["choices"][0]["message"]["content"]
+            except Exception as e:
+                logger.warning(f"Mistral key {key[:5]}... failed: {e}")
+                continue
+
+    # 2. DEEPSEEK (Fallback 1)
     if DEEPSEEK_API_KEYS:
         for _ in range(len(DEEPSEEK_API_KEYS)):
             key = DEEPSEEK_API_KEYS[deepseek_index % len(DEEPSEEK_API_KEYS)]
             deepseek_index += 1
             try:
-                headers = {"Authorization": f"Bearer {key}"}
+                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
                 payload = {
                     "model": "deepseek-chat",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": temperature
                 }
                 response = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
-                return response.json()["choices"][0]["message"]["content"]
+                if response.ok:
+                    return response.json()["choices"][0]["message"]["content"]
             except Exception as e:
                 logger.warning(f"DeepSeek key {key[:5]}... failed: {e}")
                 continue
+                
+    # 3. GEMINI (Fallback 2)
     if GEMINI_API_KEYS:
         import google.generativeai as genai
         for _ in range(len(GEMINI_API_KEYS)):
@@ -134,7 +169,8 @@ def call_ai(prompt: str, temperature: float = 0.7) -> str:
             except Exception as e:
                 logger.warning(f"Gemini key {key[:5]}... failed: {e}")
                 continue
-    return "[Simulated] No AI key available."
+
+    return "[Simulated] No AI key available. Please add MISTRAL_API_KEYS in Render."
 
 # ---------- Cycle Counters ----------
 def get_config_int(key, default=0):
@@ -199,7 +235,7 @@ async def heart_worker():
             logger.error(f"Heart worker error: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Core Approval Logic (idempotent, fast for auto) ----------
+# ---------- Core Approval Logic ----------
 async def approve_layer_by_id(layer_id: str, auto: bool = True):
     check = db.table("layer_proposals").select("status").eq("id", layer_id).execute()
     if not check.data:
@@ -246,7 +282,6 @@ async def approve_layer_by_id(layer_id: str, auto: bool = True):
         save_state(state)
         await write_audit_log("LAYER_MILESTONE", f"{state['approved_layers_count']} layers approved", "system")
 
-    # Quorum only for manual approvals
     if not auto:
         total_agents = 200
         half = total_agents // 2
@@ -299,7 +334,7 @@ async def approval_worker(worker_id: int):
 # ---------- Lung Worker ----------
 async def lung_worker():
     threshold = get_config_int("ombudsman_threshold", 85)
-    models = ["deepseek", "mistral", "groq", "gemini", "cerebras"]
+    models = ["mistral", "deepseek", "groq", "gemini", "cerebras"]
     domains = ["Medical Innovation", "Longevity Science", "Regulatory Compliance", "Venture Architecture"]
     while True:
         try:
@@ -326,6 +361,7 @@ async def lung_worker():
             model = random.choice(models)
             prompt = f"Generate a novel mutation strategy in domain: {domain}. Use context:\n{context}\nStrategy:"
             content = call_ai(prompt, temperature=0.8)
+            
             if not content or content.startswith("[Simulated]"):
                 content = f"Optimization strategy for {domain}: Increase efficiency by {random.randint(5,30)}% using {model} model."
 
@@ -365,7 +401,7 @@ async def lung_worker():
                 if patterns_ref.data:
                     refine_prompt = f"Original vetoed: {content}\nSuccessful pattern: {patterns_ref.data[0]['content']}\nEdit original to be more like pattern, keep domain {domain}. Output only edited mutation."
                     refined = call_ai(refine_prompt, temperature=0.7)
-                    if refined and refined != content:
+                    if refined and refined != content and not refined.startswith("[Simulated]"):
                         result = db.table("layer_proposals").insert({
                             "name": "Refined mutation proposal",
                             "description": refined,
@@ -416,19 +452,20 @@ async def run_retrospective_analysis(cycle_number):
     prompt = f"Top errors causing rejections: {top_errors}. Propose 5 layer improvements (name, description) as JSON array."
     try:
         response = call_ai(prompt, temperature=0.7)
-        proposals = json.loads(response)
-        for prop in proposals[:5]:
-            result = db.table("layer_proposals").insert({
-                "name": prop["name"],
-                "description": prop["description"],
-                "status": "pending",
-                "type": "error_prevention",
-                "created_at": datetime.utcnow().isoformat()
-            }).execute()
-            layer_id = result.data[0]["id"]
-            state = get_state()
-            state["pending_layers"].append({"id": layer_id, "name": prop["name"], "description": prop["description"]})
-            save_state(state)
+        if not response.startswith("[Simulated]"):
+            proposals = json.loads(response)
+            for prop in proposals[:5]:
+                result = db.table("layer_proposals").insert({
+                    "name": prop["name"],
+                    "description": prop["description"],
+                    "status": "pending",
+                    "type": "error_prevention",
+                    "created_at": datetime.utcnow().isoformat()
+                }).execute()
+                layer_id = result.data[0]["id"]
+                state = get_state()
+                state["pending_layers"].append({"id": layer_id, "name": prop["name"], "description": prop["description"]})
+                save_state(state)
     except Exception as e:
         logger.error(f"Retrospective analysis failed: {e}")
     total_agents = 200
@@ -443,7 +480,7 @@ async def run_retrospective_analysis(cycle_number):
         }).execute()
     await write_audit_log("RETROSPECTIVE_ANALYSIS", f"Cycle {cycle_number}: Analyzed {len(vetoed.data)} vetoes", "system")
 
-# ---------- Endpoints ----------
+# ---------- API Endpoints ----------
 @app.post("/api/ingest")
 async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optional[str] = Form(None), text: Optional[str] = Form(None)):
     try:
@@ -459,11 +496,13 @@ async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optiona
             source = "Raw text"
         else:
             raise HTTPException(400, "No file, URL, or text provided")
+        
         db.table("knowledge_vault").insert({
             "content": content,
             "source": source,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
+        
         ingestion_cycle = inc_config("ingestion_cycle")
         last_proposal = get_config_int("last_proposal_cycle")
         expected = ingestion_cycle // 5
@@ -471,6 +510,7 @@ async def ingest_knowledge(file: Optional[UploadFile] = File(None), url: Optiona
             for missing in range(last_proposal + 1, expected + 1):
                 create_fallback_layer(f"Ingestion cycle {missing*5}", "ingestion_mandatory")
             set_config("last_proposal_cycle", expected)
+            
         state = get_state()
         state["heart_successes"] += 5000
         state["uses"] += 25000
@@ -610,13 +650,13 @@ async def admin_cleanup_pending_layers():
     if not valid_pending:
         result = db.table("layer_proposals").insert({
             "name": "Safe Anchor Layer",
-            "description": "Auto‑created after cleanup.",
+            "description": "Auto-created after cleanup.",
             "status": "pending",
             "type": "system",
             "created_at": datetime.utcnow().isoformat()
         }).execute()
         new_id = result.data[0]["id"]
-        state["pending_layers"].append({"id": new_id, "name": "Safe Anchor Layer", "description": "Auto‑created after cleanup."})
+        state["pending_layers"].append({"id": new_id, "name": "Safe Anchor Layer", "description": "Auto-created after cleanup."})
         save_state(state)
     await write_audit_log("ADMIN_CLEANUP", f"Removed {len(removed)} invalid entries.", "admin")
     return {"removed_count": len(removed), "kept_count": len(valid_pending), "removed_examples": [l.get("id") for l in removed[:10]]}
@@ -634,34 +674,26 @@ async def queue_status():
         "workers": APPROVAL_WORKERS_COUNT
     }
 
-# ========== NEW ENDPOINT: SWARM LEARNING ==========
 @app.post("/api/swarm/learn")
 async def swarm_learn(request: dict):
     prompt = request.get("prompt", "").strip()
     if not prompt:
         raise HTTPException(400, "Missing prompt")
-    
     result = call_ai(prompt, temperature=0.7)
-    
-    # Store in knowledge vault for traceability
     db.table("knowledge_vault").insert({
         "content": f"USER PROMPT: {prompt}\n\nSWARM RESPONSE:\n{result}",
         "source": "swarm_learn",
         "created_at": datetime.utcnow().isoformat()
     }).execute()
-    
-    # Reward the system for learning
     state = get_state()
     state["heart_successes"] += 100
     state["uses"] += 500
     state["daily_learning"] += 0.5
     state["logs"].insert(0, f"[SWARM] Learned from prompt: {prompt[:50]}...")
     save_state(state)
-    
     await write_audit_log("SWARM_LEARN", f"Prompt: {prompt[:100]}", "frontend")
     return {"result": result}
 
-# ---------- Other Public Endpoints ----------
 @app.get("/api/status")
 async def get_status():
     state = get_state()
@@ -713,11 +745,11 @@ async def check_mandatory_cycles():
     expected = max(mutation_cycle // 5, ingestion_cycle // 5)
     if expected > last_proposal:
         for missing in range(last_proposal + 1, expected + 1):
-            create_fallback_layer(f"Auto‑recovered cycle {missing*5}", "auto_enforced")
+            create_fallback_layer(f"Auto-recovered cycle {missing*5}", "auto_enforced")
         set_config("last_proposal_cycle", expected)
     return {"status": "ok", "missed_filled": expected - last_proposal}
 
-# ---------- EOD Report ----------
+# ---------- EOD Report Scheduler ----------
 async def generate_eod_report():
     now = datetime.utcnow()
     today = now.date()
@@ -728,6 +760,7 @@ async def generate_eod_report():
     learning = state.get("daily_learning", 0)
     top_errors = db.table("error_analysis").select("error_pattern","frequency").order("created_at", desc=True).limit(3).execute()
     report_text = f"EOD Report {today}\nTotal layers approved today: {total_approved}\nImprovements: {len(improvements.data)}\nTop errors: {top_errors.data if top_errors.data else 'none'}\nLearning: {learning:.2f}%"
+    
     db.table("eod_reports").insert({
         "report_date": today.isoformat(),
         "total_layers_approved": total_approved,
@@ -737,6 +770,7 @@ async def generate_eod_report():
         "report_text": report_text,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
+    
     for i in range(1, 201):
         db.table("agent_messages").insert({
             "layer_id": None,
@@ -756,7 +790,7 @@ async def schedule_eod():
         await asyncio.sleep((next_run - now).total_seconds())
         await generate_eod_report()
 
-# ---------- Startup ----------
+# ---------- Startup (DYNAMIC PORT FIXED) ----------
 @app.on_event("startup")
 async def startup():
     await ensure_initial_layer()
@@ -769,4 +803,6 @@ async def startup():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Render assigns dynamic ports. Hardcoding will cause deployment crashes.
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
