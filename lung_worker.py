@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-LROS Lung Worker – FINAL STANDALONE (Mock AI, Auto‑Healing)
-Processes all backlog in minutes. No API keys required.
-"""
-
-import os
-import asyncio
-import random
-import logging
+import os, asyncio, random, logging
 from datetime import datetime, timedelta
 from supabase import create_client
 from dotenv import load_dotenv
@@ -23,36 +15,19 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 WORKER_ID = os.getenv("WORKER_ID", "default")
-BATCH_SIZE = 50       # Process 50 messages per cycle
-SLEEP_SECONDS = 10    # Short sleep for fast clearing
+BATCH_SIZE = 50
+SLEEP_SECONDS = 10
 
-# ------------------------------------------------------------------
-# Mock AI – instant, never fails
-# ------------------------------------------------------------------
 async def call_ai(prompt: str) -> str:
-    return f"[MOCK] Mutation from LROS: {prompt[:200]}"
+    return f"[MOCK] Mutation: {prompt[:200]}"
 
-# ------------------------------------------------------------------
-# Heartbeat – keeps health check happy
-# ------------------------------------------------------------------
 async def update_heartbeat():
-    supabase.table("system_config").upsert({
-        "key": "lung_last_active",
-        "value": datetime.utcnow().isoformat()
-    }).execute()
+    supabase.table("system_config").upsert({"key": "lung_last_active", "value": datetime.utcnow().isoformat()}).execute()
 
-# ------------------------------------------------------------------
-# Reset any stuck processing messages (older than 5 min)
-# ------------------------------------------------------------------
 async def auto_reset_stuck():
     five_min_ago = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
-    supabase.table("agent_messages").update({
-        "status": "pending", "processed_by": None
-    }).eq("status", "processing").lt("sent_at", five_min_ago).execute()
+    supabase.table("agent_messages").update({"status": "pending", "processed_by": None}).eq("status", "processing").lt("sent_at", five_min_ago).execute()
 
-# ------------------------------------------------------------------
-# Bulk process agent messages
-# ------------------------------------------------------------------
 async def process_agent_messages():
     result = supabase.table("agent_messages").select("*").eq("status", "pending").limit(BATCH_SIZE).execute()
     if not result.data:
@@ -71,9 +46,6 @@ async def process_agent_messages():
         supabase.table("agent_messages").update({"status": "done"}).eq("id", msg["id"]).execute()
     logger.info(f"Processed {len(result.data)} messages into mutations")
 
-# ------------------------------------------------------------------
-# Scavenge knowledge vault
-# ------------------------------------------------------------------
 async def knowledge_vault_scavenger():
     entries = supabase.table("knowledge_vault").select("*").eq("processed", False).limit(20).execute()
     if not entries.data:
@@ -91,9 +63,6 @@ async def knowledge_vault_scavenger():
         supabase.table("knowledge_vault").update({"processed": True}).eq("id", entry["id"]).execute()
     logger.info(f"Scavenged {len(entries.data)} entries")
 
-# ------------------------------------------------------------------
-# Score mutations & auto‑approve high scores
-# ------------------------------------------------------------------
 async def ombudsman_score():
     mutations = supabase.table("mutations").select("*").eq("processed", False).limit(100).execute()
     if not mutations.data:
@@ -101,10 +70,7 @@ async def ombudsman_score():
     logger.info(f"Scoring {len(mutations.data)} mutations")
     for mut in mutations.data:
         score = mut.get("score", 0) or random.randint(70, 95)
-        supabase.table("mutations").update({
-            "score": score,
-            "processed": True
-        }).eq("id", mut["id"]).execute()
+        supabase.table("mutations").update({"score": score, "processed": True}).eq("id", mut["id"]).execute()
         if score >= 90:
             supabase.table("layer_proposals").insert({
                 "name": f"Auto-{mut['id'][:8]}",
@@ -115,9 +81,6 @@ async def ombudsman_score():
             }).execute()
     logger.info(f"Scored {len(mutations.data)} mutations")
 
-# ------------------------------------------------------------------
-# Auto‑approve pending layers
-# ------------------------------------------------------------------
 async def auto_approve_layers():
     pending = supabase.table("layer_proposals").select("*").eq("status", "pending").execute()
     if len(pending.data) >= 5:
@@ -125,9 +88,6 @@ async def auto_approve_layers():
             supabase.table("layer_proposals").update({"status": "approved", "approved_at": datetime.utcnow().isoformat()}).eq("id", layer["id"]).execute()
         logger.info(f"Auto-approved {len(pending.data)} layers")
 
-# ------------------------------------------------------------------
-# Main loop
-# ------------------------------------------------------------------
 async def main_loop():
     last_heartbeat = datetime.utcnow()
     while True:
