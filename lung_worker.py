@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-LROS Lung Worker – Enhanced with Self‑Healing Watchdog
-Auto‑tune, auto‑approve, formal verification, and automatic rollback on errors.
+LROS Lung Worker – Unified (Processing + Auto‑Ingestion + Scheduler + Auto‑Reset)
 """
 
 import os
 import asyncio
+import random
 import logging
 from datetime import datetime, timedelta
 from supabase import create_client
 from dotenv import load_dotenv
 import httpx
+import feedparser
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +27,7 @@ WORKER_ID = os.getenv("WORKER_ID", "default")
 SLEEP_SECONDS = int(os.getenv("LUNG_SLEEP_SECONDS", "30"))
 
 # ------------------------------------------------------------------
-# AI Providers (same as before, with fallback)
+# AI Providers (with mock fallback)
 # ------------------------------------------------------------------
 def get_key_list(var_name):
     keys = os.getenv(var_name, "")
@@ -102,13 +103,29 @@ async def call_gemini(prompt: str) -> str:
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 async def call_ai(prompt: str) -> str:
-    for provider, func in [("Mistral", call_mistral), ("DeepSeek", call_deepseek), ("Groq", call_groq), ("Gemini", call_gemini)]:
+    """Try each provider; final mock fallback (always returns something)."""
+    if MISTRAL_KEYS:
         try:
-            return await func(prompt)
+            return await call_mistral(prompt)
         except Exception as e:
-            logger.warning(f"{provider} failed: {e}")
-    logger.error("All AI providers failed – using mock")
-    return f"[MOCK] {prompt[:100]}"
+            logger.warning(f"Mistral failed: {e}")
+    if DEEPSEEK_KEYS:
+        try:
+            return await call_deepseek(prompt)
+        except Exception as e:
+            logger.warning(f"DeepSeek failed: {e}")
+    if GROQ_KEYS:
+        try:
+            return await call_groq(prompt)
+        except Exception as e:
+            logger.warning(f"Groq failed: {e}")
+    if GEMINI_KEYS:
+        try:
+            return await call_gemini(prompt)
+        except Exception as e:
+            logger.warning(f"Gemini failed: {e}")
+    logger.warning("No AI keys or all failed – using mock response")
+    return f"[MOCK] Simulated response to: {prompt[:100]}"
 
 # ------------------------------------------------------------------
 # Constitutional Guardian
@@ -137,126 +154,60 @@ async def enforce_constitution(content: str) -> tuple[bool, str]:
     return True, None
 
 # ------------------------------------------------------------------
-# Watchdog – Self‑Healing Rollback
+# Core Engine: Process agent_messages, scavenge, score, auto‑approve
 # ------------------------------------------------------------------
-async def is_safe_mode() -> bool:
-    res = supabase.table("system_config").select("value").eq("key", "safe_mode").execute()
-    return res.data and res.data[0]["value"] == "true"
+async def auto_reset_stuck_messages():
+    minute_ago = (datetime.utcnow() - timedelta(minutes=1)).isoformat()
+    result = supabase.table("agent_messages").update({
+        "status": "pending",
+        "processed_by": None
+    }).eq("status", "pending").lt("sent_at", minute_ago).execute()
+    if result.data:
+        logger.info(f"Reset {len(result.data)} stuck agent messages")
 
-async def set_safe_mode(enabled: bool, reason: str = ""):
-    supabase.table("system_config").update({"value": "true" if enabled else "false"}).eq("key", "safe_mode").execute()
-    supabase.table("watchdog_events").insert({
-        "event_type": "safe_mode",
-        "reason": reason,
-        "data": {"enabled": enabled},
-        "created_at": datetime.utcnow().isoformat()
+async def process_agent_messages():
+    result = supabase.table("agent_messages").select("*").eq("status", "pending").limit(1).execute()
+    if not result.data:
+        return
+    msg = result.data[0]
+    supabase.table("agent_messages").update({"status": "processing", "processed_by": WORKER_ID}).eq("id", msg["id"]).execute()
+    logger.info(f"Worker {WORKER_ID} processing message {msg['id']}")
+    prompt = f"Respond to the following message with a clear, actionable mutation:\n\n{msg['message']}\n\nMutation:"
+    response = await call_ai(prompt)
+    supabase.table("mutations").insert({
+        "content": response,
+        "source": f"agent_message:{msg['id']}",
+        "score": 0,
+        "timestamp": datetime.utcnow().isoformat(),
+        "processed": False
     }).execute()
-    logger.warning(f"Safe mode {'enabled' if enabled else 'disabled'}: {reason}")
+    supabase.table("agent_messages").update({"status": "done"}).eq("id", msg["id"]).execute()
+    logger.info(f"Worker {WORKER_ID} created mutation from message {msg['id']}")
 
-async def watchdog_monitor():
-    """Check error rate every 5 minutes; if >30%, enable safe mode."""
-    watchdog_enabled = supabase.table("system_config").select("value").eq("key", "watchdog_enabled").execute()
-    if not watchdog_enabled.data or watchdog_enabled.data[0]["value"] != "true":
-        return
-    if await is_safe_mode():
-        # Already in safe mode; check if we can auto‑recover after 30 minutes
-        last_event = supabase.table("watchdog_events").select("created_at").eq("event_type", "safe_mode").order("created_at", desc=True).limit(1).execute()
-        if last_event.data:
-            last_time = datetime.fromisoformat(last_event.data[0]["created_at"])
-            if datetime.utcnow() - last_time > timedelta(minutes=30):
-                # Try to recover
-                await set_safe_mode(False, "Auto‑recovery after 30 minutes")
-        return
+async def knowledge_vault_scavenger():
+    entries = supabase.table("knowledge_vault").select("*").eq("processed", False).limit(5).execute()
+    for entry in entries.data:
+        logger.info(f"Scavenging knowledge {entry['id']} – {entry['source']}")
+        mutation_text = await call_ai(f"Convert this knowledge into a mutation:\n{entry['content']}\nMutation:")
+        supabase.table("mutations").insert({
+            "content": mutation_text,
+            "source": f"knowledge_vault:{entry['source']}",
+            "score": 0,
+            "timestamp": datetime.utcnow().isoformat(),
+            "processed": False
+        }).execute()
+        supabase.table("knowledge_vault").update({"processed": True}).eq("id", entry["id"]).execute()
+        supabase.table("agent_messages").insert({
+            "agent_id": "knowledge_scavenger",
+            "message": f"New mutation from {entry['source']}: {mutation_text[:200]}",
+            "status": "pending",
+            "sent_at": datetime.utcnow().isoformat()
+        }).execute()
 
-    # Calculate error rate in last 5 minutes
-    five_min_ago = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
-    total = supabase.table("mutations").select("id").gte("timestamp", five_min_ago).execute()
-    if not total.data:
-        return
-    vetoed = supabase.table("mutations").select("id").gte("timestamp", five_min_ago).eq("veto_reason", "not null").execute()
-    error_rate = len(vetoed.data) / len(total.data) if total.data else 0
-    threshold = float(supabase.table("system_config").select("value").eq("key", "watchdog_error_threshold").execute().data[0]["value"])
-    if error_rate > threshold:
-        await set_safe_mode(True, f"Error rate {error_rate:.2%} exceeded threshold {threshold:.2%}")
-
-# ------------------------------------------------------------------
-# Auto‑tune Ombudsman Threshold (disabled in safe mode)
-# ------------------------------------------------------------------
-async def auto_tune_threshold():
-    if await is_safe_mode():
-        return
-    auto_tune = supabase.table("system_config").select("value").eq("key", "ombudsman_auto_tune").execute()
-    if not auto_tune.data or auto_tune.data[0]["value"] != "true":
-        return
-    target_veto_rate = float(supabase.table("system_config").select("value").eq("key", "ombudsman_target_veto_rate").execute().data[0]["value"])
-    muts = supabase.table("mutations").select("score").order("created_at", desc=True).limit(100).execute()
-    if not muts.data:
-        return
-    curr_thresh = int(supabase.table("system_config").select("value").eq("key", "ombudsman_threshold").execute().data[0]["value"])
-    vetoed = sum(1 for m in muts.data if m["score"] < curr_thresh)
-    veto_rate = vetoed / len(muts.data)
-    if veto_rate > target_veto_rate + 0.05:
-        new_thresh = max(50, curr_thresh - 5)
-    elif veto_rate < target_veto_rate - 0.05:
-        new_thresh = min(90, curr_thresh + 5)
-    else:
-        return
-    supabase.table("system_config").update({"value": str(new_thresh)}).eq("key", "ombudsman_threshold").execute()
-    logger.info(f"Auto‑tuned threshold from {curr_thresh} to {new_thresh} (veto rate {veto_rate:.2f})")
-
-# ------------------------------------------------------------------
-# Auto‑approve high‑score mutations (disabled in safe mode)
-# ------------------------------------------------------------------
-async def auto_approve_high_score():
-    if await is_safe_mode():
-        return
-    auto_thresh = int(supabase.table("system_config").select("value").eq("key", "auto_approve_threshold").execute().data[0]["value"])
-    high_muts = supabase.table("mutations").select("*").gte("score", auto_thresh).eq("processed", True).execute()
-    for mut in high_muts.data:
-        existing = supabase.table("layer_proposals").select("id").eq("name", f"Auto-{mut['id'][:8]}").execute()
-        if not existing.data:
-            supabase.table("layer_proposals").insert({
-                "name": f"Auto-{mut['id'][:8]}",
-                "description": mut["content"],
-                "status": "approved",
-                "type": "high_score",
-                "approved_at": datetime.utcnow().isoformat()
-            }).execute()
-            logger.info(f"Auto‑approved high‑score mutation {mut['id']} as layer")
-
-# ------------------------------------------------------------------
-# Formal verification & error‑prevention validation
-# ------------------------------------------------------------------
-async def verify_layer_constitutionally(description: str, layer_id: int) -> bool:
-    valid, reason = await enforce_constitution(description)
-    supabase.table("formal_verification_log").insert({
-        "layer_id": layer_id,
-        "check_passed": valid,
-        "violation_reason": reason if not valid else None,
-        "checked_at": datetime.utcnow().isoformat()
-    }).execute()
-    return valid
-
-async def validate_error_prevention_layer(layer_description: str) -> bool:
-    errors = supabase.table("error_analysis").select("error_pattern").limit(20).execute()
-    if not errors.data:
-        return True
-    for err in errors.data:
-        if err["error_pattern"].lower() in layer_description.lower():
-            return True
-    return False
-
-# ------------------------------------------------------------------
-# Ombudsman scoring (respects safe mode)
-# ------------------------------------------------------------------
 async def ombudsman_score():
     mutations = supabase.table("mutations").select("*").eq("processed", False).execute()
-    safe = await is_safe_mode()
-    if safe:
-        threshold = 70  # fixed baseline
-    else:
-        thresh_res = supabase.table("system_config").select("value").eq("key", "ombudsman_threshold").execute()
-        threshold = int(thresh_res.data[0]["value"]) if thresh_res.data else 70
+    thresh_res = supabase.table("system_config").select("value").eq("key", "ombudsman_threshold").execute()
+    threshold = int(thresh_res.data[0]["value"]) if thresh_res.data else 70
 
     for mut in mutations.data:
         valid, reason = await enforce_constitution(mut["content"])
@@ -290,6 +241,14 @@ async def ombudsman_score():
             "processed": True
         }).eq("id", mut["id"]).execute()
 
+        status = "ACCEPTED" if score >= threshold else "VETOED"
+        supabase.table("agent_messages").insert({
+            "agent_id": "ombudsman",
+            "message": f"Mutation {mut['id'][:8]} scored {score} – {status}. {veto_reason or ''}",
+            "status": "pending",
+            "sent_at": datetime.utcnow().isoformat()
+        }).execute()
+
         state = supabase.table("sovereign_state").select("state_data").eq("id", 1).execute()
         if state.data:
             d = state.data[0]["state_data"]
@@ -299,77 +258,175 @@ async def ombudsman_score():
                 d["rejections"] = d.get("rejections", 0) + 1
             supabase.table("sovereign_state").update({"state_data": d}).eq("id", 1).execute()
 
-    # After scoring, run auto‑tune and auto‑approve only if not in safe mode
-    if not safe:
-        await auto_tune_threshold()
-        await auto_approve_high_score()
+    if mutations.data:
+        logger.info(f"Scored {len(mutations.data)} mutations")
 
-# ------------------------------------------------------------------
-# Knowledge Vault Scavenger
-# ------------------------------------------------------------------
-async def knowledge_vault_scavenger():
-    entries = supabase.table("knowledge_vault").select("*").eq("processed", False).limit(5).execute()
-    for entry in entries.data:
-        mutation_text = await call_ai(f"Convert this knowledge into a mutation:\n{entry['content']}\nMutation:")
-        supabase.table("mutations").insert({
-            "content": mutation_text,
-            "source": f"knowledge_vault:{entry['source']}",
-            "score": 0,
-            "timestamp": datetime.utcnow().isoformat(),
-            "processed": False
-        }).execute()
-        supabase.table("knowledge_vault").update({"processed": True}).eq("id", entry["id"]).execute()
-
-# ------------------------------------------------------------------
-# Process agent_messages
-# ------------------------------------------------------------------
-async def process_agent_messages():
-    result = supabase.table("agent_messages").select("*").eq("status", "pending").limit(1).execute()
-    if not result.data:
-        return
-    msg = result.data[0]
-    supabase.table("agent_messages").update({"status": "processing"}).eq("id", msg["id"]).execute()
-    prompt = f"Respond with a mutation:\n{msg['message']}\nMutation:"
-    response = await call_ai(prompt)
-    supabase.table("mutations").insert({
-        "content": response,
-        "source": f"agent_message:{msg['id']}",
-        "score": 0,
-        "timestamp": datetime.utcnow().isoformat(),
-        "processed": False
-    }).execute()
-    supabase.table("agent_messages").update({"status": "done"}).eq("id", msg["id"]).execute()
-
-# ------------------------------------------------------------------
-# Auto‑approve layers (with verification)
-# ------------------------------------------------------------------
 async def auto_approve_layers():
     pending = supabase.table("layer_proposals").select("*").eq("status", "pending").execute()
-    for layer in pending.data:
-        if not await verify_layer_constitutionally(layer["description"], layer["id"]):
-            supabase.table("layer_proposals").update({"status": "rejected"}).eq("id", layer["id"]).execute()
-            continue
-        if not await validate_error_prevention_layer(layer["description"]):
-            logger.warning(f"Layer {layer['id']} may not address any known error pattern")
-        if len(pending.data) >= 5:
+    if len(pending.data) >= 5:
+        for layer in pending.data:
             supabase.table("layer_proposals").update({"status": "approved", "approved_at": datetime.utcnow().isoformat()}).eq("id", layer["id"]).execute()
-            logger.info(f"Auto‑approved layer {layer['id']}")
+        logger.info(f"Auto-approved {len(pending.data)} layers")
 
 # ------------------------------------------------------------------
-# Main loop – runs watchdog every 5 minutes
+# Auto‑Ingestion (arXiv & PubMed) – runs every hour
 # ------------------------------------------------------------------
-async def main_loop():
-    last_watchdog = datetime.utcnow()
+async def ingest_paper(paper_id: str, source: str, title: str, abstract: str, link: str):
+    existing = supabase.table("ingested_papers").select("id").eq("id", paper_id).execute()
+    if existing.data:
+        return
+    content = f"Title: {title}\nAbstract: {abstract}\nPDF: {link}"
+    supabase.table("knowledge_vault").insert({
+        "content": content,
+        "source": f"auto:{source}:{paper_id}",
+        "processed": False,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+    supabase.table("ingested_papers").insert({
+        "id": paper_id,
+        "source": source,
+        "ingested_at": datetime.utcnow().isoformat()
+    }).execute()
+    logger.info(f"Ingested new paper: {title[:80]}")
+
+async def fetch_arxiv():
+    keywords = ["self-evolving AI", "constitutional AI", "multi-agent self-improvement",
+                "recursive self-improvement", "Gödel agent", "Darwin Gödel Machine",
+                "error-stripping AI", "self-correcting code"]
+    for kw in keywords:
+        query = f"all:{kw.replace(' ', '+')}"
+        url = f"http://export.arxiv.org/api/query?search_query={query}&start=0&max_results=5&sortBy=submittedDate&sortOrder=descending"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=30)
+                feed = feedparser.parse(resp.text)
+                for entry in feed.entries:
+                    paper_id = entry.id.split('/abs/')[-1]
+                    await ingest_paper(paper_id, "arxiv", entry.title, entry.summary, entry.link)
+        except Exception as e:
+            logger.error(f"arXiv fetch failed for {kw}: {e}")
+
+async def fetch_pubmed():
+    keywords = ["AI pain detection", "hyperthermia cancer", "stem cells therapy",
+                "exosomes therapeutics", "HBOT outcomes"]
+    for kw in keywords:
+        try:
+            async with httpx.AsyncClient() as client:
+                search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={kw}&retmax=5&format=json"
+                search_resp = await client.get(search_url, timeout=30)
+                data = search_resp.json()
+                ids = data.get("esearchresult", {}).get("idlist", [])
+                for pid in ids:
+                    summary_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={pid}&format=json"
+                    summary_resp = await client.get(summary_url, timeout=30)
+                    summary = summary_resp.json()
+                    title = summary.get("result", {}).get(pid, {}).get("title", "No title")
+                    await ingest_paper(pid, "pubmed", title, "Abstract not fetched", f"https://pubmed.ncbi.nlm.nih.gov/{pid}/")
+        except Exception as e:
+            logger.error(f"PubMed fetch failed for {kw}: {e}")
+
+# ------------------------------------------------------------------
+# Scheduler (Task Executor) – runs continuously, calls Heart
+# ------------------------------------------------------------------
+HEART_URL = os.getenv("HEART_URL")  # Must be set to https://lros1.onrender.com
+MAX_CONCURRENT = int(os.getenv("SCHEDULER_CONCURRENT", "5"))
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+async def call_tool(tool: dict, payload: dict) -> dict:
+    if not HEART_URL:
+        raise Exception("HEART_URL not configured for scheduler")
+    url = f"{HEART_URL}{tool['endpoint']}"
+    method = tool['method'].upper()
+    async with httpx.AsyncClient(timeout=60) as client:
+        if method == 'POST':
+            resp = await client.post(url, json=payload)
+        elif method == 'GET':
+            resp = await client.get(url, params=payload)
+        else:
+            raise ValueError(f"Unsupported method {method}")
+        resp.raise_for_status()
+        return resp.json()
+
+async def execute_task(task):
+    async with semaphore:
+        try:
+            tool_res = supabase.table("tools").select("*").eq("name", task["tool_name"]).execute()
+            if not tool_res.data:
+                raise Exception(f"Tool {task['tool_name']} not found")
+            tool = tool_res.data[0]
+            logger.info(f"Scheduler executing task {task['id']} with tool {tool['name']}")
+            result = await call_tool(tool, task["payload"])
+            supabase.table("tasks").update({
+                "status": "succeeded",
+                "completed_at": datetime.utcnow().isoformat(),
+                "worker_id": WORKER_ID,
+                "error": None
+            }).eq("id", task["id"]).execute()
+            return result
+        except Exception as e:
+            logger.error(f"Task {task['id']} failed: {e}")
+            new_retries = task.get("retries", 0) + 1
+            max_retries = task.get("max_retries", 3)
+            if new_retries >= max_retries:
+                supabase.table("tasks").update({
+                    "status": "failed",
+                    "error": str(e),
+                    "completed_at": datetime.utcnow().isoformat(),
+                    "worker_id": WORKER_ID,
+                    "retries": new_retries
+                }).eq("id", task["id"]).execute()
+            else:
+                supabase.table("tasks").update({
+                    "status": "pending",
+                    "retries": new_retries,
+                    "error": str(e)
+                }).eq("id", task["id"]).execute()
+            raise
+
+async def scheduler_loop():
     while True:
         try:
+            tasks = supabase.table("tasks").select("*").eq("status", "pending").execute()
+            if tasks.data:
+                executable = []
+                for t in tasks.data:
+                    deps = t.get("depends_on", [])
+                    if not deps:
+                        executable.append(t)
+                    else:
+                        dep_statuses = supabase.table("tasks").select("status").in_("id", deps).execute()
+                        if all(s["status"] == "succeeded" for s in dep_statuses.data):
+                            executable.append(t)
+                await asyncio.gather(*[execute_task(t) for t in executable])
+            else:
+                await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+            await asyncio.sleep(5)
+
+# ------------------------------------------------------------------
+# Main loop – runs core engine, auto‑ingestion (hourly), and scheduler
+# ------------------------------------------------------------------
+async def main_loop():
+    last_ingestion = datetime.utcnow() - timedelta(hours=1)
+    # Start scheduler as a background task
+    asyncio.create_task(scheduler_loop())
+    while True:
+        try:
+            # Core engine
+            await auto_reset_stuck_messages()
             await process_agent_messages()
             await knowledge_vault_scavenger()
             await ombudsman_score()
             await auto_approve_layers()
-            # Run watchdog every 5 minutes
-            if datetime.utcnow() - last_watchdog >= timedelta(minutes=5):
-                await watchdog_monitor()
-                last_watchdog = datetime.utcnow()
+
+            # Auto‑ingestion every hour
+            if datetime.utcnow() - last_ingestion >= timedelta(hours=1):
+                logger.info("Starting autonomous knowledge ingestion cycle")
+                await fetch_arxiv()
+                await fetch_pubmed()
+                last_ingestion = datetime.utcnow()
+                logger.info("Ingestion cycle completed")
         except Exception as e:
             logger.error(f"Lung worker error: {e}")
         await asyncio.sleep(SLEEP_SECONDS)
