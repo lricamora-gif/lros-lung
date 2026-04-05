@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-LROS Lung Worker – BULK PROCESSING (Mock AI, No Hangs)
+LROS Lung Worker – FINAL STANDALONE (Mock AI, Auto‑Healing)
+Processes all backlog in minutes. No API keys required.
 """
 
 import os
@@ -22,17 +23,17 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 WORKER_ID = os.getenv("WORKER_ID", "default")
-BATCH_SIZE = 50   # Process 50 messages per cycle
-SLEEP_SECONDS = 10
+BATCH_SIZE = 50       # Process 50 messages per cycle
+SLEEP_SECONDS = 10    # Short sleep for fast clearing
 
 # ------------------------------------------------------------------
-# Mock AI – always returns a response instantly
+# Mock AI – instant, never fails
 # ------------------------------------------------------------------
 async def call_ai(prompt: str) -> str:
     return f"[MOCK] Mutation from LROS: {prompt[:200]}"
 
 # ------------------------------------------------------------------
-# Heartbeat – updates system_config every minute
+# Heartbeat – keeps health check happy
 # ------------------------------------------------------------------
 async def update_heartbeat():
     supabase.table("system_config").upsert({
@@ -41,7 +42,7 @@ async def update_heartbeat():
     }).execute()
 
 # ------------------------------------------------------------------
-# Reset stuck messages (older than 5 minutes)
+# Reset any stuck processing messages (older than 5 min)
 # ------------------------------------------------------------------
 async def auto_reset_stuck():
     five_min_ago = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
