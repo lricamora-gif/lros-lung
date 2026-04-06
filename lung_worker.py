@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, asyncio, random, logging
+import os, asyncio, random, logging, aiohttp
 from datetime import datetime, timedelta
 from supabase import create_client
 from dotenv import load_dotenv
@@ -18,8 +18,28 @@ WORKER_ID = os.getenv("WORKER_ID", "default")
 BATCH_SIZE = 50
 SLEEP_SECONDS = 10
 
+# ------------------------------------------------------------------
+# REAL AI CALL (Ollama) with fallback to mock only on error
+# ------------------------------------------------------------------
 async def call_ai(prompt: str) -> str:
-    return f"[MOCK] Mutation: {prompt[:200]}"
+    ollama_url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": "phi3:mini",   # make sure this model is pulled (ollama pull phi3:mini)
+        "prompt": prompt,
+        "stream": False
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(ollama_url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("response", "")
+                else:
+                    logger.error(f"Ollama returned status {resp.status}: {await resp.text()}")
+                    return f"[MOCK] Mutation (Ollama error {resp.status}): {prompt[:200]}"
+    except Exception as e:
+        logger.error(f"Ollama exception: {e}")
+        return f"[MOCK] Mutation (exception): {prompt[:200]}"
 
 async def update_heartbeat():
     supabase.table("system_config").upsert({"key": "lung_last_active", "value": datetime.utcnow().isoformat()}).execute()
