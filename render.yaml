@@ -1,36 +1,13 @@
 services:
-  - type: web
-    name: lros-heart
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn heart:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_KEY
-        sync: false
-      - key: MISTRAL_API_KEY
-        sync: false
-      - key: SENDGRID_API_KEY
-        sync: false
-      - key: FOUNDER_EMAIL
-        sync: false
-      - key: PAYMONGO_WEBHOOK_SECRET
-        sync: false
-      - key: PORT
-        value: 10000
-
   - type: worker
-    name: lros-lung
+    name: lros-lung-worker
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python lung.py
+    startCommand: python3 -u lung_worker.py
     envVars:
       - key: SUPABASE_URL
-        sync: false
+        value: https://favywzxbugvivqefqpxl.supabase.co
       - key: SUPABASE_SERVICE_KEY
-        sync: false
-      - key: MISTRAL_API_KEY
-        sync: false
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhdnl3enhidWd2aXZxZWZxcHhsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTgzNDAzMCwiZXhwIjoyMDg3NDEwMDMwfQ.HaQIjyZnMIUkqBAecr-eo1ffqDxnW2g2S1BaYfhslaY
       - key: WORKER_ID
-        value: lung_render
+        value: lung_render_worker_2
