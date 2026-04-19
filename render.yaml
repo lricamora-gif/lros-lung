@@ -9,8 +9,10 @@ services:
       - key: SUPABASE_URL
         value: https://favywzxbugvivqefqpxl.supabase.co
       - key: SUPABASE_SERVICE_KEY
-        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhdnl3enhidWd2aXZxZWZxcHhsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTgzNDAzMCwiZXhwIjoyMDg3NDEwMDMwfQ.HaQIjyZnMIUkqBAecr-eo1ffqDxnW2g2S1BaYfhslaY
       - key: LUNG_WORKERS
         value: "150"
       - key: WORKER_ID
         value: lung_render_worker_1
+      - key: OLLAMA_HOST
+        value: http://65.21.63.230:11434
